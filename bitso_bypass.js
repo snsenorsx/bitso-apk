@@ -1,21 +1,22 @@
 /*
- * Bitso Wallet - Comprehensive Frida Bypass Script v3.0
+ * Bitso Wallet - Comprehensive Frida Bypass Script v3.1
  * =====================================================
  * Compatible with: Frida 17.x + Android 15 (Pixel 10 Pro XL)
  *
- * Fixes:
- *   - "Unable to find copied methods in java/lang/Thread" bug
- *   - /proc/self/maps Frida detection -> app self-kill
- *   - SSL pinning bypass that doesn't break internet
+ * v3.1 fixes:
+ *   - Native hooks: use null module (global search) instead of "libc.so"
+ *   - Anti-kill: Memory.patchCode + Arm64Writer fallback for _exit/exit/abort
+ *   - kill(self): Interceptor.attach + modify signal arg to 0
+ *   - Removed ClassLoader.loadClass hook (causes ART GC crash)
+ *   - Removed Java.enumerateLoadedClasses (causes ART GC crash)
+ *   - Removed Build property spoofing (real device - not needed)
+ *   - Increased Java hook delay to 3s for ART stability
  *
  * Usage:
  *   frida -U -f com.bitso.wallet -l bitso_bypass.js
- *   frida -U -f com.bitso.wallet -l bitso_bypass.js 2>&1 | python3 frida_relay.py
  */
 
-"use strict";
-
-var VERSION = "3.0";
+var VERSION = "3.1";
 var DETECTIONS = [];
 var ERRORS = [];
 var hookStats = { installed: 0, failed: 0 };
@@ -30,7 +31,7 @@ function log(cat, msg) {
 function logTrigger(cat, msg) {
     console.log("[~] [TRIGGER] [" + cat + "] " + msg);
     DETECTIONS.push({ cat: cat, msg: msg, ts: Date.now() });
-    send({ type: "detection", category: cat, message: msg });
+    try { send({ type: "detection", category: cat, message: msg }); } catch (e) {}
 }
 
 function logErr(cat, msg) {
@@ -48,14 +49,43 @@ function hookFail(id, desc, err) {
     console.log("[-] [FAIL] [" + id + "] " + desc + ": " + err);
 }
 
+// Safe export finder - tries null (global search), then "libc.so"
+function findExport(name) {
+    try {
+        var p = Module.findExportByName(null, name);
+        if (p && !p.isNull()) return p;
+    } catch (e) {}
+    try {
+        var p2 = Module.findExportByName("libc.so", name);
+        if (p2 && !p2.isNull()) return p2;
+    } catch (e) {}
+    return null;
+}
+
 // ============================================================
-// PHASE 1: NATIVE HOOKS (run BEFORE Java VM - no Thread bug)
-// These protect against /proc/self/maps scanning and app self-kill
+// PHASE 1: NATIVE HOOKS (run BEFORE Java VM)
 // ============================================================
 function installNativeHooks() {
     log("NATIVE", "=== Installing native-level protections ===");
 
-    var libc = "libc.so";
+    // --- DIAGNOSTICS ---
+    console.log("[DIAG] typeof Module: " + typeof Module);
+    console.log("[DIAG] typeof Interceptor: " + typeof Interceptor);
+    console.log("[DIAG] typeof NativeCallback: " + typeof NativeCallback);
+    console.log("[DIAG] typeof NativeFunction: " + typeof NativeFunction);
+    console.log("[DIAG] typeof Arm64Writer: " + typeof Arm64Writer);
+
+    try {
+        var libcMod = Process.findModuleByName("libc.so");
+        console.log("[DIAG] libc module: " + (libcMod ? libcMod.path : "NOT FOUND"));
+    } catch (e) {
+        console.log("[DIAG] Process.findModuleByName error: " + e);
+    }
+
+    var testPtr = findExport("_exit");
+    console.log("[DIAG] _exit ptr: " + testPtr);
+    var testPtr2 = findExport("open");
+    console.log("[DIAG] open ptr: " + testPtr2);
 
     var fridaKeywords = [
         "frida", "gadget", "gum-js-loop", "gmain", "linjector",
@@ -64,113 +94,119 @@ function installNativeHooks() {
     ];
 
     // --- N1) Block app self-termination ---
-    // The app calls _exit() / exit() / kill() after detecting Frida in /proc/self/maps
-    try {
-        var _exit_ptr = Module.findExportByName(libc, "_exit");
-        if (_exit_ptr) {
-            Interceptor.replace(_exit_ptr, new NativeCallback(function (status) {
-                logTrigger("ANTI-KILL", "_exit(" + status + ") BLOCKED - app tried to kill itself");
-                // Don't actually exit
-            }, "void", ["int"]));
-            hookOk("N1a", "_exit() blocked");
+    function patchWithRet(name, id) {
+        var addr = findExport(name);
+        if (!addr) {
+            hookFail(id, name + " not found", "export not found");
+            return;
         }
-    } catch (e) { hookFail("N1a", "_exit block", e); }
 
-    try {
-        var exit_ptr = Module.findExportByName(libc, "exit");
-        if (exit_ptr) {
-            Interceptor.replace(exit_ptr, new NativeCallback(function (status) {
-                logTrigger("ANTI-KILL", "exit(" + status + ") BLOCKED");
+        // Try 1: Interceptor.replace with NativeCallback
+        try {
+            Interceptor.replace(addr, new NativeCallback(function () {
+                logTrigger("ANTI-KILL", name + "() BLOCKED");
             }, "void", ["int"]));
-            hookOk("N1b", "exit() blocked");
+            hookOk(id, name + "() blocked (replace)");
+            return;
+        } catch (e1) {
+            console.log("[DIAG] " + name + " replace failed: " + e1);
         }
-    } catch (e) { hookFail("N1b", "exit block", e); }
 
-    // Block kill(getpid(), signal) - app killing its own process
-    try {
-        var kill_ptr = Module.findExportByName(libc, "kill");
-        var getpid_fn = new NativeFunction(Module.findExportByName(libc, "getpid"), "int", []);
-        if (kill_ptr) {
-            var orig_kill = new NativeFunction(kill_ptr, "int", ["int", "int"]);
-            Interceptor.replace(kill_ptr, new NativeCallback(function (pid, sig) {
-                var myPid = getpid_fn();
-                if (pid === myPid) {
-                    logTrigger("ANTI-KILL", "kill(self, " + sig + ") BLOCKED");
-                    return 0;
+        // Try 2: Memory.patchCode with ARM64 RET instruction
+        try {
+            Memory.patchCode(addr, 4, function (code) {
+                var w = new Arm64Writer(code, { pc: addr });
+                w.putRet();
+                w.flush();
+            });
+            hookOk(id, name + "() blocked (ARM64 RET patch)");
+            return;
+        } catch (e2) {
+            console.log("[DIAG] " + name + " patchCode failed: " + e2);
+        }
+
+        // Try 3: Interceptor.attach for logging only
+        try {
+            Interceptor.attach(addr, {
+                onEnter: function (args) {
+                    logTrigger("ANTI-KILL", name + "(" + args[0] + ") called (NOT blocked)");
                 }
-                return orig_kill(pid, sig);
-            }, "int", ["int", "int"]));
-            hookOk("N1c", "kill(self) blocked");
+            });
+            hookOk(id, name + "() monitored (attach only)");
+        } catch (e3) {
+            hookFail(id, name, e3);
         }
-    } catch (e) { hookFail("N1c", "kill block", e); }
+    }
 
-    // Also block abort()
+    patchWithRet("_exit", "N1a");
+    patchWithRet("exit", "N1b");
+    patchWithRet("abort", "N1d");
+
+    // kill(self) - modify signal arg to 0 via Interceptor.attach
     try {
-        var abort_ptr = Module.findExportByName(libc, "abort");
-        if (abort_ptr) {
-            Interceptor.replace(abort_ptr, new NativeCallback(function () {
-                logTrigger("ANTI-KILL", "abort() BLOCKED");
-            }, "void", []));
-            hookOk("N1d", "abort() blocked");
+        var kill_ptr = findExport("kill");
+        var getpid_ptr = findExport("getpid");
+        if (kill_ptr && getpid_ptr) {
+            var getpid_fn = new NativeFunction(getpid_ptr, "int", []);
+            Interceptor.attach(kill_ptr, {
+                onEnter: function (args) {
+                    var pid = args[0].toInt32();
+                    var sig = args[1].toInt32();
+                    if (pid === getpid_fn() && sig !== 0) {
+                        logTrigger("ANTI-KILL", "kill(self, " + sig + ") -> kill(self, 0)");
+                        args[1] = ptr(0);
+                    }
+                }
+            });
+            hookOk("N1c", "kill(self) signal neutralized");
+        } else {
+            hookFail("N1c", "kill", "export not found");
         }
-    } catch (e) { hookFail("N1d", "abort block", e); }
+    } catch (e) { hookFail("N1c", "kill", e); }
 
     // --- N2) /proc/self/maps filtering ---
-    // Track which fds point to /proc/self/maps
     var mapsFds = {};
 
     try {
-        var open_ptr = Module.findExportByName(libc, "open");
+        var open_ptr = findExport("open");
         if (open_ptr) {
             Interceptor.attach(open_ptr, {
                 onEnter: function (args) {
-                    try {
-                        this.path = args[0].readUtf8String();
-                    } catch (e) {
-                        this.path = null;
-                    }
+                    try { this.path = args[0].readUtf8String(); } catch (e) { this.path = null; }
                 },
                 onLeave: function (retval) {
-                    if (this.path !== null && this.path.indexOf("/proc") !== -1 &&
-                        this.path.indexOf("maps") !== -1) {
+                    if (this.path && this.path.indexOf("/proc") !== -1 && this.path.indexOf("maps") !== -1) {
                         var fd = retval.toInt32();
                         if (fd >= 0) {
                             mapsFds[fd] = true;
-                            logTrigger("MAPS", "/proc/*/maps opened (fd=" + fd + "): " + this.path);
+                            logTrigger("MAPS", "open('" + this.path + "') fd=" + fd);
                         }
                     }
                 }
             });
-            hookOk("N2a", "/proc/self/maps open() tracking");
+            hookOk("N2a", "open() /proc/maps tracking");
         }
     } catch (e) { hookFail("N2a", "open tracking", e); }
 
-    // Also track fopen
     try {
-        var fopen_ptr = Module.findExportByName(libc, "fopen");
+        var fopen_ptr = findExport("fopen");
         if (fopen_ptr) {
             Interceptor.attach(fopen_ptr, {
                 onEnter: function (args) {
-                    try {
-                        this.path = args[0].readUtf8String();
-                    } catch (e) {
-                        this.path = null;
-                    }
+                    try { this.path = args[0].readUtf8String(); } catch (e) { this.path = null; }
                 },
                 onLeave: function (retval) {
-                    if (this.path !== null && this.path.indexOf("/proc") !== -1 &&
-                        this.path.indexOf("maps") !== -1 && !retval.isNull()) {
-                        logTrigger("MAPS", "/proc/*/maps fopen: " + this.path);
+                    if (this.path && this.path.indexOf("/proc") !== -1 && this.path.indexOf("maps") !== -1 && !retval.isNull()) {
+                        logTrigger("MAPS", "fopen('" + this.path + "')");
                     }
                 }
             });
-            hookOk("N2a2", "/proc/self/maps fopen() tracking");
+            hookOk("N2a2", "fopen() /proc/maps tracking");
         }
     } catch (e) { hookFail("N2a2", "fopen tracking", e); }
 
-    // Filter fgets output - hide frida entries from maps
     try {
-        var fgets_ptr = Module.findExportByName(libc, "fgets");
+        var fgets_ptr = findExport("fgets");
         if (fgets_ptr) {
             Interceptor.attach(fgets_ptr, {
                 onLeave: function (retval) {
@@ -179,43 +215,40 @@ function installNativeHooks() {
                         var line = retval.readUtf8String();
                         if (line) {
                             var ll = line.toLowerCase();
-                            // Filter frida entries
                             for (var i = 0; i < fridaKeywords.length; i++) {
                                 if (ll.indexOf(fridaKeywords[i]) !== -1) {
                                     retval.writeUtf8String("00000000-00000000 ---p 00000000 00:00 0\n");
-                                    logTrigger("MAPS-FILTER", "Filtered: " + line.trim().substring(0, 80));
+                                    logTrigger("MAPS-FILTER", "fgets filtered: " + line.trim().substring(0, 60));
                                     return;
                                 }
                             }
-                            // Spoof TracerPid
                             if (ll.indexOf("tracerpid:") !== -1 && ll.indexOf("tracerpid:\t0") === -1) {
                                 retval.writeUtf8String("TracerPid:\t0\n");
-                                logTrigger("TRACER", "TracerPid spoofed to 0");
+                                logTrigger("TRACER", "TracerPid -> 0");
                             }
                         }
                     } catch (e) {}
                 }
             });
-            hookOk("N2b", "fgets() maps/TracerPid filtering");
+            hookOk("N2b", "fgets() frida/TracerPid filtering");
         }
-    } catch (e) { hookFail("N2b", "fgets filtering", e); }
+    } catch (e) { hookFail("N2b", "fgets", e); }
 
-    // Filter read() for binary reads of maps
     try {
-        var read_ptr = Module.findExportByName(libc, "read");
+        var read_ptr = findExport("read");
         if (read_ptr) {
             Interceptor.attach(read_ptr, {
                 onEnter: function (args) {
                     this.fd = args[0].toInt32();
                     this.buf = args[1];
-                    this.size = args[2].toInt32();
+                    this.sz = args[2].toInt32();
                 },
                 onLeave: function (retval) {
                     if (!mapsFds[this.fd]) return;
-                    var bytesRead = retval.toInt32();
-                    if (bytesRead <= 0) return;
+                    var n = retval.toInt32();
+                    if (n <= 0) return;
                     try {
-                        var content = this.buf.readUtf8String(bytesRead);
+                        var content = this.buf.readUtf8String(n);
                         if (!content) return;
                         var lines = content.split("\n");
                         var filtered = [];
@@ -224,11 +257,7 @@ function installNativeHooks() {
                             var ll = lines[i].toLowerCase();
                             var bad = false;
                             for (var j = 0; j < fridaKeywords.length; j++) {
-                                if (ll.indexOf(fridaKeywords[j]) !== -1) {
-                                    bad = true;
-                                    removed++;
-                                    break;
-                                }
+                                if (ll.indexOf(fridaKeywords[j]) !== -1) { bad = true; removed++; break; }
                             }
                             if (!bad) filtered.push(lines[i]);
                         }
@@ -236,18 +265,17 @@ function installNativeHooks() {
                             var clean = filtered.join("\n");
                             this.buf.writeUtf8String(clean);
                             retval.replace(clean.length);
-                            logTrigger("MAPS-FILTER", "read(): removed " + removed + " frida entries");
+                            logTrigger("MAPS-FILTER", "read() removed " + removed + " frida entries");
                         }
                     } catch (e) {}
                 }
             });
             hookOk("N2c", "read() maps filtering");
         }
-    } catch (e) { hookFail("N2c", "read filtering", e); }
+    } catch (e) { hookFail("N2c", "read", e); }
 
-    // Clean up mapsFds on close
     try {
-        var close_ptr = Module.findExportByName(libc, "close");
+        var close_ptr = findExport("close");
         if (close_ptr) {
             Interceptor.attach(close_ptr, {
                 onEnter: function (args) {
@@ -260,7 +288,7 @@ function installNativeHooks() {
 
     // --- N3) strstr bypass ---
     try {
-        var strstr_ptr = Module.findExportByName(libc, "strstr");
+        var strstr_ptr = findExport("strstr");
         if (strstr_ptr) {
             Interceptor.attach(strstr_ptr, {
                 onEnter: function (args) {
@@ -272,7 +300,6 @@ function installNativeHooks() {
                             for (var i = 0; i < fridaKeywords.length; i++) {
                                 if (nl.indexOf(fridaKeywords[i]) !== -1) {
                                     this.shouldBlock = true;
-                                    logTrigger("STRSTR", "strstr blocked: " + needle);
                                     break;
                                 }
                             }
@@ -281,7 +308,7 @@ function installNativeHooks() {
                 },
                 onLeave: function (retval) {
                     if (this.shouldBlock) {
-                        retval.replace(ptr(0)); // NULL = not found
+                        retval.replace(ptr(0));
                     }
                 }
             });
@@ -291,37 +318,37 @@ function installNativeHooks() {
 
     // --- N4) __system_property_get ---
     try {
-        var prop_get = Module.findExportByName(libc, "__system_property_get");
+        var prop_get = findExport("__system_property_get");
         if (prop_get) {
             Interceptor.attach(prop_get, {
                 onEnter: function (args) {
-                    this.name = args[0].readUtf8String();
+                    try { this.propName = args[0].readUtf8String(); } catch (e) { this.propName = null; }
                     this.valueBuf = args[1];
                 },
                 onLeave: function (retval) {
-                    if (this.name === "ro.debuggable") {
-                        this.valueBuf.writeUtf8String("0");
-                    } else if (this.name === "ro.secure") {
-                        this.valueBuf.writeUtf8String("1");
-                    } else if (this.name === "ro.build.tags") {
-                        this.valueBuf.writeUtf8String("release-keys");
-                    } else if (this.name === "service.adb.root") {
-                        this.valueBuf.writeUtf8String("0");
-                    }
+                    if (this.propName === "ro.debuggable") this.valueBuf.writeUtf8String("0");
+                    else if (this.propName === "ro.secure") this.valueBuf.writeUtf8String("1");
+                    else if (this.propName === "ro.build.tags") this.valueBuf.writeUtf8String("release-keys");
+                    else if (this.propName === "service.adb.root") this.valueBuf.writeUtf8String("0");
                 }
             });
             hookOk("N4", "__system_property_get spoofing");
         }
-    } catch (e) { hookFail("N4", "property spoofing", e); }
+    } catch (e) { hookFail("N4", "property_get", e); }
 
     // --- N5) ptrace ---
     try {
-        var ptrace_ptr = Module.findExportByName(libc, "ptrace");
+        var ptrace_ptr = findExport("ptrace");
         if (ptrace_ptr) {
-            Interceptor.replace(ptrace_ptr, new NativeCallback(function (req, pid, addr, data) {
-                logTrigger("PTRACE", "ptrace(" + req + ") -> 0");
-                return 0;
-            }, "int", ["int", "int", "pointer", "pointer"]));
+            Interceptor.attach(ptrace_ptr, {
+                onEnter: function (args) {
+                    this.req = args[0].toInt32();
+                },
+                onLeave: function (retval) {
+                    retval.replace(0);
+                    logTrigger("PTRACE", "ptrace(" + this.req + ") -> 0");
+                }
+            });
             hookOk("N5", "ptrace() -> 0");
         }
     } catch (e) { hookFail("N5", "ptrace", e); }
@@ -335,7 +362,7 @@ function installNativeHooks() {
         "/cache/recovery/xposed.zip"
     ];
     try {
-        var access_ptr = Module.findExportByName(libc, "access");
+        var access_ptr = findExport("access");
         if (access_ptr) {
             Interceptor.attach(access_ptr, {
                 onEnter: function (args) {
@@ -343,11 +370,7 @@ function installNativeHooks() {
                         var p = args[0].readUtf8String();
                         if (p) {
                             for (var i = 0; i < nativeRootPaths.length; i++) {
-                                if (p.indexOf(nativeRootPaths[i]) !== -1) {
-                                    this.blockIt = true;
-                                    logTrigger("ACCESS", "access() blocked: " + p);
-                                    break;
-                                }
+                                if (p === nativeRootPaths[i]) { this.blockIt = true; break; }
                             }
                         }
                     } catch (e) {}
@@ -362,7 +385,7 @@ function installNativeHooks() {
 
     // --- N7) stat() for root files ---
     try {
-        var stat_ptr = Module.findExportByName(libc, "stat");
+        var stat_ptr = findExport("stat");
         if (stat_ptr) {
             Interceptor.attach(stat_ptr, {
                 onEnter: function (args) {
@@ -370,10 +393,7 @@ function installNativeHooks() {
                         var p = args[0].readUtf8String();
                         if (p) {
                             for (var i = 0; i < nativeRootPaths.length; i++) {
-                                if (p.indexOf(nativeRootPaths[i]) !== -1) {
-                                    this.blockIt = true;
-                                    break;
-                                }
+                                if (p === nativeRootPaths[i]) { this.blockIt = true; break; }
                             }
                         }
                     } catch (e) {}
@@ -386,10 +406,10 @@ function installNativeHooks() {
         }
     } catch (e) { hookFail("N7", "stat", e); }
 
-    // --- N8) dlopen monitoring for security libs ---
+    // --- N8) dlopen monitoring ---
     try {
-        var dlopen_ptr = Module.findExportByName(null, "android_dlopen_ext") ||
-                         Module.findExportByName(null, "dlopen");
+        var dlopen_ptr = findExport("android_dlopen_ext");
+        if (!dlopen_ptr) dlopen_ptr = findExport("dlopen");
         if (dlopen_ptr) {
             Interceptor.attach(dlopen_ptr, {
                 onEnter: function (args) {
@@ -418,10 +438,11 @@ function installNativeHooks() {
 
 // ============================================================
 // PHASE 2: JAVA HOOKS (delayed to avoid Thread bug on Android 15)
+// NOTE: ClassLoader.loadClass hook REMOVED - causes ART GC crash
+// NOTE: Java.enumerateLoadedClasses REMOVED - causes ART GC crash
 // ============================================================
 function installJavaHooks() {
 
-    // === ROOT DETECTION ===
     log("ROOT", "=== Bypassing root detection ===");
 
     var rootPaths = [
@@ -437,10 +458,12 @@ function installJavaHooks() {
         "/sbin/.magisk/modules/riru_lsposed"
     ];
 
-    // R1: File.exists
+    // R1: File.exists - with recursion guard
     try {
         var File = Java.use("java.io.File");
+        var _existsGuard = false;
         File.exists.implementation = function () {
+            if (_existsGuard) return this.exists();
             var path = this.getAbsolutePath();
             for (var i = 0; i < rootPaths.length; i++) {
                 if (path === rootPaths[i]) {
@@ -448,7 +471,12 @@ function installJavaHooks() {
                     return false;
                 }
             }
-            return this.exists();
+            _existsGuard = true;
+            try {
+                return this.exists();
+            } finally {
+                _existsGuard = false;
+            }
         };
         hookOk("R1", "File.exists() (" + rootPaths.length + " paths)");
     } catch (e) { hookFail("R1", "File.exists", e); }
@@ -547,7 +575,7 @@ function installJavaHooks() {
         hookOk("R6", "SplashActivity.B0");
     } catch (e) { hookFail("R6", "SplashActivity", e); }
 
-    // R7: Sentry root checker (try both obfuscated and non-obfuscated)
+    // R7: Sentry root checker
     try {
         var SR = Java.use("io.sentry.android.core.internal.util.RootChecker");
         SR.isDeviceRooted.implementation = function () {
@@ -594,38 +622,9 @@ function installJavaHooks() {
         hookOk("R8", "SiftScience root detection");
     } catch (e) { hookFail("R8", "SiftScience", e); }
 
-    // R9: SharedPreferences root data source
-    try {
-        // Search for rooted device check data source classes
-        Java.enumerateLoadedClasses({
-            onMatch: function (name) {
-                if (name.indexOf("RootedDeviceCheckDataSource") !== -1) {
-                    try {
-                        var cls = Java.use(name);
-                        var methods = cls.class.getDeclaredMethods();
-                        for (var i = 0; i < methods.length; i++) {
-                            var m = methods[i];
-                            if (m.getReturnType().getName() === "boolean") {
-                                var mName = m.getName();
-                                cls[mName].implementation = function () {
-                                    logTrigger("ROOT", "RootedDeviceCheckDataSource -> false");
-                                    return false;
-                                };
-                                hookOk("R9", "SharedPref root check: " + name + "." + mName);
-                                break;
-                            }
-                        }
-                    } catch (e3) {}
-                }
-            },
-            onComplete: function () {}
-        });
-    } catch (e) {}
-
     // === SSL PINNING (lightweight) ===
     log("SSL", "=== Bypassing SSL pinning (lightweight - internet stays working) ===");
 
-    // S1: CertificatePinner.check -> no-op (DO NOT touch Builder.add)
     try {
         var CP = Java.use("okhttp3.CertificatePinner");
         CP.check.overload("java.lang.String", "java.util.List").implementation = function (host, certs) {
@@ -639,7 +638,6 @@ function installJavaHooks() {
         hookOk("S1", "OkHttp CertificatePinner.check -> no-op");
     } catch (e) { hookFail("S1", "CertificatePinner", e); }
 
-    // S2: Conscrypt TrustManagerImpl
     try {
         var TMI = Java.use("com.android.org.conscrypt.TrustManagerImpl");
         TMI.verifyChain.implementation = function (untrusted, anchors, host, clientAuth, ocsp, tlsSct) {
@@ -649,7 +647,6 @@ function installJavaHooks() {
         hookOk("S2", "Conscrypt TrustManagerImpl");
     } catch (e) { hookFail("S2", "TrustManagerImpl", e); }
 
-    // S3: NetworkSecurityTrustManager
     try {
         var NSTM = Java.use("android.security.net.config.NetworkSecurityTrustManager");
         NSTM.checkServerTrusted.overload("[Ljava.security.cert.X509Certificate;", "java.lang.String").implementation = function (certs, authType) {
@@ -658,7 +655,6 @@ function installJavaHooks() {
         hookOk("S3", "NetworkSecurityTrustManager");
     } catch (e) { hookFail("S3", "NetworkSecurityTrustManager", e); }
 
-    // S4: OkHostnameVerifier
     try {
         var OHV = Java.use("okhttp3.internal.tls.OkHostnameVerifier");
         OHV.verify.overload("java.lang.String", "javax.net.ssl.SSLSession").implementation = function (host, session) {
@@ -668,7 +664,6 @@ function installJavaHooks() {
         hookOk("S4", "OkHostnameVerifier");
     } catch (e) { hookFail("S4", "OkHostnameVerifier", e); }
 
-    // S5: WebViewClient SSL error
     try {
         var WVC = Java.use("android.webkit.WebViewClient");
         WVC.onReceivedSslError.implementation = function (view, handler, error) {
@@ -678,12 +673,10 @@ function installJavaHooks() {
         hookOk("S5", "WebViewClient SSL");
     } catch (e) { hookFail("S5", "WebViewClient", e); }
 
-    // S6: HttpsURLConnection hostname verifier (lightweight - only intercept set, don't replace global)
     try {
         var HSURLC = Java.use("javax.net.ssl.HttpsURLConnection");
         HSURLC.setDefaultHostnameVerifier.implementation = function (verifier) {
             logTrigger("SSL", "HttpsURLConnection.setDefaultHostnameVerifier intercepted");
-            // Let it through - don't block, just log
             this.setDefaultHostnameVerifier(verifier);
         };
         hookOk("S6", "HttpsURLConnection monitoring");
@@ -692,25 +685,6 @@ function installJavaHooks() {
     // === EMULATOR DETECTION ===
     log("EMU", "=== Bypassing emulator detection ===");
 
-    try {
-        var Build2 = Java.use("android.os.Build");
-        var props = {
-            "PRODUCT": "walleye", "HARDWARE": "walleye",
-            "MANUFACTURER": "Google", "MODEL": "Pixel 2",
-            "BRAND": "google", "DEVICE": "walleye", "BOARD": "walleye",
-            "FINGERPRINT": "google/walleye/walleye:11/RP1A.200720.009/6720564:user/release-keys"
-        };
-        for (var k in props) {
-            try {
-                var ff = Build2.class.getDeclaredField(k);
-                ff.setAccessible(true);
-                ff.set(null, Java.use("java.lang.String").$new(props[k]));
-            } catch (e2) {}
-        }
-        hookOk("E1", "Build properties spoofed");
-    } catch (e) { hookFail("E1", "Build props", e); }
-
-    // E2: Jumio
     try {
         var Jumio = Java.use("com.jumio.sdk.JumioSDK$Companion");
         Jumio.isRooted.implementation = function (ctx) {
@@ -731,21 +705,9 @@ function installJavaHooks() {
     } catch (e) { hookFail("D1", "Debug", e); }
 
     // === FRIDA DETECTION (Java) ===
-    log("FRIDA", "=== Bypassing Frida detection (Java) ===");
-
-    try {
-        var CL = Java.use("java.lang.ClassLoader");
-        CL.loadClass.overload("java.lang.String").implementation = function (name) {
-            if (name === "de.robv.android.xposed.XposedBridge" ||
-                name === "de.robv.android.xposed.XC_MethodHook" ||
-                name === "com.saurik.substrate.MS") {
-                logTrigger("FRIDA", "Xposed/Substrate class load blocked: " + name);
-                throw Java.use("java.lang.ClassNotFoundException").$new(name);
-            }
-            return this.loadClass(name);
-        };
-        hookOk("F1", "Xposed/Substrate class blocking");
-    } catch (e) { hookFail("F1", "ClassLoader", e); }
+    // ClassLoader.loadClass hook REMOVED - causes ART GC crash on Android 15
+    log("FRIDA", "=== Frida detection handled by native hooks ===");
+    hookOk("F-NOTE", "Native strstr + maps filtering active");
 
     // === PLAY INTEGRITY ===
     log("INTEGRITY", "=== Monitoring Play Integrity ===");
@@ -877,7 +839,7 @@ function printErrors() {
 }
 
 // ============================================================
-// MAIN - Two-phase startup to avoid Android 15 Thread bug
+// MAIN - Two-phase startup
 // ============================================================
 console.log("==================================================");
 console.log("[*] Bitso Bypass v" + VERSION + " - Android 15 Compatible");
@@ -887,9 +849,8 @@ console.log("==================================================");
 // PHASE 1: Native hooks - immediate, no Java.perform
 installNativeHooks();
 
-// PHASE 2: Java hooks - delayed 1.5s to let ART VM fully initialize
-// This avoids "Unable to find copied methods in java/lang/Thread" bug
-console.log("[*] Phase 2: Java hooks starting in 1.5s...");
+// PHASE 2: Java hooks - delayed 3s to let ART VM fully initialize
+console.log("[*] Phase 2: Java hooks starting in 3s...");
 
 setTimeout(function () {
     Java.perform(function () {
@@ -897,7 +858,7 @@ setTimeout(function () {
             installJavaHooks();
         } catch (e) {
             logErr("INIT", "Java hooks failed: " + e);
-            console.log("[!] Retrying Java hooks in 3s...");
+            console.log("[!] Retrying Java hooks in 5s...");
             setTimeout(function () {
                 Java.perform(function () {
                     try {
@@ -908,7 +869,7 @@ setTimeout(function () {
                         console.log("[!!!] Native-only protection is active.");
                     }
                 });
-            }, 3000);
+            }, 5000);
         }
     });
 
@@ -918,8 +879,8 @@ setTimeout(function () {
         console.log("[*] Hooks: " + hookStats.installed + " OK, " + hookStats.failed + " failed");
         console.log("[*] Commands: printStats() printTriggers() printErrors()");
         console.log("==================================================\n");
-    }, 3000);
-}, 1500);
+    }, 5000);
+}, 3000);
 
 // RPC exports
 rpc.exports = {
