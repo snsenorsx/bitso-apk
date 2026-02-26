@@ -375,76 +375,88 @@ function bypassFridaDetection() {
 }
 
 // ============================================================
-// 3) SSL PINNING BYPASS
+// 3) SSL PINNING BYPASS (lightweight - does NOT break connectivity)
 // ============================================================
 function bypassSSLPinning() {
-    log("SSL", "Initializing SSL pinning bypass...");
+    log("SSL", "Initializing SSL pinning bypass (lightweight mode)...");
 
-    // --- 3a) OkHttp CertificatePinner bypass ---
+    // --- 3a) OkHttp CertificatePinner.check() - make it a no-op ---
+    // IMPORTANT: We only skip the CHECK, we do NOT touch Builder.add().
+    // Removing pins from the builder breaks OkHttp's TLS handshake entirely.
     try {
         var CertificatePinner = Java.use("okhttp3.CertificatePinner");
         CertificatePinner.check.overload("java.lang.String", "java.util.List").implementation = function (hostname, peerCertificates) {
             logDetection("SSL_OKHTTP", "CertificatePinner.check bypassed for: " + hostname);
+            // Do nothing - skip pin validation but connection stays alive
         };
-        CertificatePinner["check$okhttp"].implementation = function (hostname, cleanedCerts) {
-            logDetection("SSL_OKHTTP", "CertificatePinner.check$okhttp bypassed for: " + hostname);
-        };
+        try {
+            CertificatePinner["check$okhttp"].implementation = function (hostname, cleanedCerts) {
+                logDetection("SSL_OKHTTP", "CertificatePinner.check$okhttp bypassed for: " + hostname);
+            };
+        } catch (e2) {
+            log("SSL", "check$okhttp not found (OK - older OkHttp): " + e2);
+        }
+        log("SSL", "[1] OkHttp CertificatePinner.check() -> no-op (pins still added, just not enforced)");
     } catch (e) {
         log("SSL", "OkHttp CertificatePinner hook: " + e);
     }
 
-    // --- 3b) idwall SDK certificate pinning bypass (sha256/AHYMQP+2/...) ---
+    // --- 3b) Android platform TrustManagerImpl (if present) ---
+    // This bypasses system-level cert validation without replacing the global SSLSocketFactory
     try {
-        var CertPinnerBuilder = Java.use("okhttp3.CertificatePinner$Builder");
-        CertPinnerBuilder.add.overload("java.lang.String", "[Ljava.lang.String;").implementation = function (hostname, pins) {
-            logDetection("SSL_IDWALL", "CertificatePinner.Builder.add bypassed for: " + hostname);
-            // Return builder without actually adding the pin
-            return this;
+        var TrustManagerImpl = Java.use("com.android.org.conscrypt.TrustManagerImpl");
+        TrustManagerImpl.verifyChain.implementation = function (untrustedChain, trustAnchorChain, host, clientAuth, ocspData, tlsSctData) {
+            logDetection("SSL_CONSCRYPT", "TrustManagerImpl.verifyChain bypassed for: " + host);
+            return untrustedChain;
         };
+        log("SSL", "[2] Conscrypt TrustManagerImpl.verifyChain() bypassed");
     } catch (e) {
-        log("SSL", "CertificatePinner.Builder hook: " + e);
+        log("SSL", "TrustManagerImpl hook (non-critical): " + e);
     }
 
-    // --- 3c) TrustManager bypass (accept all certificates) ---
+    // --- 3c) Network security config trust anchors ---
+    // Hook the NetworkSecurityConfig to accept all certificates
     try {
-        var X509TrustManager = Java.use("javax.net.ssl.X509TrustManager");
-        var SSLContext = Java.use("javax.net.ssl.SSLContext");
-
-        var TrustManager = Java.registerClass({
-            name: "com.bitso.bypass.TrustAllManager",
-            implements: [X509TrustManager],
-            methods: {
-                checkClientTrusted: function (chain, authType) {},
-                checkServerTrusted: function (chain, authType) {},
-                getAcceptedIssuers: function () {
-                    return [];
-                }
-            }
-        });
-
-        var TrustManagers = [TrustManager.$new()];
-        var sslContext = SSLContext.getInstance("TLS");
-        sslContext.init(null, TrustManagers, null);
-
-        var SSLSocketFactory = Java.use("javax.net.ssl.HttpsURLConnection");
-        SSLSocketFactory.setDefaultSSLSocketFactory.call(SSLSocketFactory, sslContext.getSocketFactory());
-        SSLSocketFactory.setDefaultHostnameVerifier.call(SSLSocketFactory, Java.use("org.apache.http.conn.ssl.AllowAllHostnameVerifier").$new());
+        var NetworkSecurityTrustManager = Java.use("android.security.net.config.NetworkSecurityTrustManager");
+        NetworkSecurityTrustManager.checkServerTrusted.overload("[Ljava.security.cert.X509Certificate;", "java.lang.String").implementation = function (certs, authType) {
+            logDetection("SSL_NETSEC", "NetworkSecurityTrustManager.checkServerTrusted bypassed");
+        };
+        log("SSL", "[3] NetworkSecurityTrustManager bypassed");
     } catch (e) {
-        log("SSL", "Global TrustManager bypass: " + e);
+        log("SSL", "NetworkSecurityTrustManager hook (non-critical): " + e);
     }
 
-    // --- 3d) WebViewClient SSL error bypass ---
+    // --- 3d) OkHttp HostnameVerifier ---
+    try {
+        var OkHostnameVerifier = Java.use("okhttp3.internal.tls.OkHostnameVerifier");
+        OkHostnameVerifier.verify.overload("java.lang.String", "javax.net.ssl.SSLSession").implementation = function (hostname, session) {
+            logDetection("SSL_HOSTNAME", "OkHostnameVerifier.verify bypassed for: " + hostname);
+            return true;
+        };
+        log("SSL", "[4] OkHostnameVerifier bypassed");
+    } catch (e) {
+        log("SSL", "OkHostnameVerifier hook (non-critical): " + e);
+    }
+
+    // --- 3e) WebViewClient SSL error bypass ---
     try {
         var WebViewClient = Java.use("android.webkit.WebViewClient");
         WebViewClient.onReceivedSslError.implementation = function (view, handler, error) {
             logDetection("SSL_WEBVIEW", "WebView SSL error bypassed: " + error.toString());
             handler.proceed();
         };
+        log("SSL", "[5] WebViewClient SSL error bypass applied");
     } catch (e) {
         log("SSL", "WebViewClient hook: " + e);
     }
 
-    log("SSL", "SSL pinning bypass initialized");
+    // NOTE: We intentionally do NOT:
+    // - Replace the global SSLSocketFactory (breaks all HTTPS)
+    // - Replace the global HostnameVerifier (breaks all HTTPS)
+    // - Neutralize CertificatePinner.Builder.add() (breaks OkHttp client setup)
+    // These aggressive approaches cause "no internet" issues.
+
+    log("SSL", "SSL pinning bypass initialized (lightweight - internet should work)");
 }
 
 // ============================================================
