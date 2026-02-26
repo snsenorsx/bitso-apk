@@ -1,108 +1,458 @@
 /*
- * Bitso Wallet - Comprehensive Frida Bypass Script
- * ================================================
- * Bypasses: Root Detection, Frida Detection, SSL Pinning, Emulator Detection,
- *           Debugger Detection, Play Integrity, FingerprintJS Pro, iProov Calcifer,
- *           Sift Science Device Properties, Sentry Root Check, WebView JS Injection Detection
+ * Bitso Wallet - Comprehensive Frida Bypass Script v3.0
+ * =====================================================
+ * Compatible with: Frida 17.x + Android 15 (Pixel 10 Pro XL)
  *
- * Usage: frida -U -f com.bitso.wallet -l bitso_bypass.js --no-pause
+ * Fixes:
+ *   - "Unable to find copied methods in java/lang/Thread" bug
+ *   - /proc/self/maps Frida detection -> app self-kill
+ *   - SSL pinning bypass that doesn't break internet
  *
- * Communication: Pipe output to the relay script for real-time analysis
- *   frida -U -f com.bitso.wallet -l bitso_bypass.js --no-pause 2>&1 | python3 frida_relay.py
+ * Usage:
+ *   frida -U -f com.bitso.wallet -l bitso_bypass.js
+ *   frida -U -f com.bitso.wallet -l bitso_bypass.js 2>&1 | python3 frida_relay.py
  */
 
 "use strict";
 
-var TAG = "[BITSO-BYPASS]";
-var DETECTIONS_FOUND = [];
+var VERSION = "3.0";
+var DETECTIONS = [];
+var ERRORS = [];
+var hookStats = { installed: 0, failed: 0 };
 
-function log(category, msg) {
-    var ts = new Date().toISOString();
-    var line = ts + " " + TAG + " [" + category + "] " + msg;
-    console.log(line);
-    send({ type: "log", category: category, message: msg, timestamp: ts });
+// ============================================================
+// LOGGING
+// ============================================================
+function log(cat, msg) {
+    console.log("[*] [" + cat + "] " + msg);
 }
 
-function logDetection(category, detail) {
-    DETECTIONS_FOUND.push({ category: category, detail: detail });
-    log("DETECTION", category + " => " + detail);
+function logTrigger(cat, msg) {
+    console.log("[~] [TRIGGER] [" + cat + "] " + msg);
+    DETECTIONS.push({ cat: cat, msg: msg, ts: Date.now() });
+    send({ type: "detection", category: cat, message: msg });
+}
+
+function logErr(cat, msg) {
+    console.log("[!] [ERROR] [" + cat + "] " + msg);
+    ERRORS.push({ cat: cat, msg: msg });
+}
+
+function hookOk(id, desc) {
+    hookStats.installed++;
+    console.log("[+] [OK] [" + id + "] " + desc);
+}
+
+function hookFail(id, desc, err) {
+    hookStats.failed++;
+    console.log("[-] [FAIL] [" + id + "] " + desc + ": " + err);
 }
 
 // ============================================================
-// 1) ROOT DETECTION BYPASS
+// PHASE 1: NATIVE HOOKS (run BEFORE Java VM - no Thread bug)
+// These protect against /proc/self/maps scanning and app self-kill
 // ============================================================
-function bypassRootDetection() {
-    log("ROOT", "Initializing root detection bypass...");
+function installNativeHooks() {
+    log("NATIVE", "=== Installing native-level protections ===");
 
-    // --- 1a) File.exists() bypass for su/root paths ---
-    var rootPaths = [
-        "/system/app/Superuser.apk",
-        "/sbin/su", "/system/bin/su", "/system/xbin/su",
-        "/data/local/xbin/su", "/data/local/bin/su",
-        "/system/sd/xbin/su", "/system/bin/failsafe/su",
-        "/data/local/su", "/su/bin/su", "/su/bin",
-        "/system/xbin/daemonsu",
-        // Magisk paths
-        "/sbin/.magisk", "/sbin/.magisk/modules",
-        "/data/adb/magisk", "/data/magisk",
-        "/data/magisk/resetprop",
-        "/magisk/.core/bin/",
-        // Xposed/LSPosed paths  
-        "/system/framework/XposedBridge.jar",
-        "/system/lib/libxposed_art.so",
-        "/system/lib64/libxposed_art.so",
-        "/system/bin/app_process_xposed",
-        "/system/bin/app_process32_xposed",
-        "/system/bin/app_process64_xposed",
-        "/system/bin/app_process32_orig",
-        "/system/bin/app_process64_orig",
-        "/system/bin/dex2oat_xposed",
-        "/system/bin/patchoat_xposed",
-        "/system/xposed.prop",
-        "/cache/recovery/xposed.zip",
-        // LSPosed specific
-        "/data/adb/modules/riru_lsposed",
-        "/sbin/.magisk/modules/riru_lsposed",
-        "/data/data/moe.lsposed/dexm/lsposed.dex",
-        "/data/data/org.lsposed.manager",
-        "/data/user_de/0/org.lsposed.manager",
-        "/storage/emulated/0/Android/data/org.lsposed.manager",
-        "/data/media/0/Android/data/org.lsposed.manager",
-        "/data/misc/profiles/ref/org.lsposed.manager",
-        "/config/sdcardfs/org.lsposed.manager",
-        "/mnt/runtime/full/emulated/0/Android/data/org.lsposed.manager",
-        "/data/unencrypted/magisk/riru_lsposed",
-        "/dev/riru_IwV9Hu8/modules/riru_lsposed@lspd",
-        "/system/framework/org.lsposed.manager",
-        "/data/data/com.google.android.gms/files/backup_chunk_listings/org.lsposed.manager",
-        // Riru/EdXposed
-        "/system/lib/libriru_edxp.so",
-        "/system/lib64/libriru_edxp.so",
-        // Magisk Xposed
-        "/magisk/xposed/system/lib/libart-compiler.so",
-        "/magisk/xposed/system/lib/libart-disassembler.so",
-        "/magisk/xposed/system/lib/libart.so",
-        "/magisk/xposed/system/lib/libsigchain.so",
-        // iProov calcifer extra paths
-        "/system/usr/we-need-root/",
-        "/system/bin/.ext/",
-        "/system/sbin"
+    var libc = "libc.so";
+
+    var fridaKeywords = [
+        "frida", "gadget", "gum-js-loop", "gmain", "linjector",
+        "frida-agent", "frida-server", "frida-gadget",
+        "re.frida.server", "com.saurik.substrate"
     ];
 
-    var File = Java.use("java.io.File");
-    var originalExists = File.exists;
-    File.exists.implementation = function () {
-        var path = this.getAbsolutePath();
-        for (var i = 0; i < rootPaths.length; i++) {
-            if (path === rootPaths[i] || path.indexOf(rootPaths[i]) !== -1) {
-                logDetection("ROOT_FILE", "File.exists blocked: " + path);
-                return false;
-            }
+    // --- N1) Block app self-termination ---
+    // The app calls _exit() / exit() / kill() after detecting Frida in /proc/self/maps
+    try {
+        var _exit_ptr = Module.findExportByName(libc, "_exit");
+        if (_exit_ptr) {
+            Interceptor.replace(_exit_ptr, new NativeCallback(function (status) {
+                logTrigger("ANTI-KILL", "_exit(" + status + ") BLOCKED - app tried to kill itself");
+                // Don't actually exit
+            }, "void", ["int"]));
+            hookOk("N1a", "_exit() blocked");
         }
-        return originalExists.call(this);
-    };
+    } catch (e) { hookFail("N1a", "_exit block", e); }
 
-    // --- 1b) PackageManager root app detection bypass ---
+    try {
+        var exit_ptr = Module.findExportByName(libc, "exit");
+        if (exit_ptr) {
+            Interceptor.replace(exit_ptr, new NativeCallback(function (status) {
+                logTrigger("ANTI-KILL", "exit(" + status + ") BLOCKED");
+            }, "void", ["int"]));
+            hookOk("N1b", "exit() blocked");
+        }
+    } catch (e) { hookFail("N1b", "exit block", e); }
+
+    // Block kill(getpid(), signal) - app killing its own process
+    try {
+        var kill_ptr = Module.findExportByName(libc, "kill");
+        var getpid_fn = new NativeFunction(Module.findExportByName(libc, "getpid"), "int", []);
+        if (kill_ptr) {
+            var orig_kill = new NativeFunction(kill_ptr, "int", ["int", "int"]);
+            Interceptor.replace(kill_ptr, new NativeCallback(function (pid, sig) {
+                var myPid = getpid_fn();
+                if (pid === myPid) {
+                    logTrigger("ANTI-KILL", "kill(self, " + sig + ") BLOCKED");
+                    return 0;
+                }
+                return orig_kill(pid, sig);
+            }, "int", ["int", "int"]));
+            hookOk("N1c", "kill(self) blocked");
+        }
+    } catch (e) { hookFail("N1c", "kill block", e); }
+
+    // Also block abort()
+    try {
+        var abort_ptr = Module.findExportByName(libc, "abort");
+        if (abort_ptr) {
+            Interceptor.replace(abort_ptr, new NativeCallback(function () {
+                logTrigger("ANTI-KILL", "abort() BLOCKED");
+            }, "void", []));
+            hookOk("N1d", "abort() blocked");
+        }
+    } catch (e) { hookFail("N1d", "abort block", e); }
+
+    // --- N2) /proc/self/maps filtering ---
+    // Track which fds point to /proc/self/maps
+    var mapsFds = {};
+
+    try {
+        var open_ptr = Module.findExportByName(libc, "open");
+        if (open_ptr) {
+            Interceptor.attach(open_ptr, {
+                onEnter: function (args) {
+                    try {
+                        this.path = args[0].readUtf8String();
+                    } catch (e) {
+                        this.path = null;
+                    }
+                },
+                onLeave: function (retval) {
+                    if (this.path !== null && this.path.indexOf("/proc") !== -1 &&
+                        this.path.indexOf("maps") !== -1) {
+                        var fd = retval.toInt32();
+                        if (fd >= 0) {
+                            mapsFds[fd] = true;
+                            logTrigger("MAPS", "/proc/*/maps opened (fd=" + fd + "): " + this.path);
+                        }
+                    }
+                }
+            });
+            hookOk("N2a", "/proc/self/maps open() tracking");
+        }
+    } catch (e) { hookFail("N2a", "open tracking", e); }
+
+    // Also track fopen
+    try {
+        var fopen_ptr = Module.findExportByName(libc, "fopen");
+        if (fopen_ptr) {
+            Interceptor.attach(fopen_ptr, {
+                onEnter: function (args) {
+                    try {
+                        this.path = args[0].readUtf8String();
+                    } catch (e) {
+                        this.path = null;
+                    }
+                },
+                onLeave: function (retval) {
+                    if (this.path !== null && this.path.indexOf("/proc") !== -1 &&
+                        this.path.indexOf("maps") !== -1 && !retval.isNull()) {
+                        logTrigger("MAPS", "/proc/*/maps fopen: " + this.path);
+                    }
+                }
+            });
+            hookOk("N2a2", "/proc/self/maps fopen() tracking");
+        }
+    } catch (e) { hookFail("N2a2", "fopen tracking", e); }
+
+    // Filter fgets output - hide frida entries from maps
+    try {
+        var fgets_ptr = Module.findExportByName(libc, "fgets");
+        if (fgets_ptr) {
+            Interceptor.attach(fgets_ptr, {
+                onLeave: function (retval) {
+                    if (retval.isNull()) return;
+                    try {
+                        var line = retval.readUtf8String();
+                        if (line) {
+                            var ll = line.toLowerCase();
+                            // Filter frida entries
+                            for (var i = 0; i < fridaKeywords.length; i++) {
+                                if (ll.indexOf(fridaKeywords[i]) !== -1) {
+                                    retval.writeUtf8String("00000000-00000000 ---p 00000000 00:00 0\n");
+                                    logTrigger("MAPS-FILTER", "Filtered: " + line.trim().substring(0, 80));
+                                    return;
+                                }
+                            }
+                            // Spoof TracerPid
+                            if (ll.indexOf("tracerpid:") !== -1 && ll.indexOf("tracerpid:\t0") === -1) {
+                                retval.writeUtf8String("TracerPid:\t0\n");
+                                logTrigger("TRACER", "TracerPid spoofed to 0");
+                            }
+                        }
+                    } catch (e) {}
+                }
+            });
+            hookOk("N2b", "fgets() maps/TracerPid filtering");
+        }
+    } catch (e) { hookFail("N2b", "fgets filtering", e); }
+
+    // Filter read() for binary reads of maps
+    try {
+        var read_ptr = Module.findExportByName(libc, "read");
+        if (read_ptr) {
+            Interceptor.attach(read_ptr, {
+                onEnter: function (args) {
+                    this.fd = args[0].toInt32();
+                    this.buf = args[1];
+                    this.size = args[2].toInt32();
+                },
+                onLeave: function (retval) {
+                    if (!mapsFds[this.fd]) return;
+                    var bytesRead = retval.toInt32();
+                    if (bytesRead <= 0) return;
+                    try {
+                        var content = this.buf.readUtf8String(bytesRead);
+                        if (!content) return;
+                        var lines = content.split("\n");
+                        var filtered = [];
+                        var removed = 0;
+                        for (var i = 0; i < lines.length; i++) {
+                            var ll = lines[i].toLowerCase();
+                            var bad = false;
+                            for (var j = 0; j < fridaKeywords.length; j++) {
+                                if (ll.indexOf(fridaKeywords[j]) !== -1) {
+                                    bad = true;
+                                    removed++;
+                                    break;
+                                }
+                            }
+                            if (!bad) filtered.push(lines[i]);
+                        }
+                        if (removed > 0) {
+                            var clean = filtered.join("\n");
+                            this.buf.writeUtf8String(clean);
+                            retval.replace(clean.length);
+                            logTrigger("MAPS-FILTER", "read(): removed " + removed + " frida entries");
+                        }
+                    } catch (e) {}
+                }
+            });
+            hookOk("N2c", "read() maps filtering");
+        }
+    } catch (e) { hookFail("N2c", "read filtering", e); }
+
+    // Clean up mapsFds on close
+    try {
+        var close_ptr = Module.findExportByName(libc, "close");
+        if (close_ptr) {
+            Interceptor.attach(close_ptr, {
+                onEnter: function (args) {
+                    var fd = args[0].toInt32();
+                    if (mapsFds[fd]) delete mapsFds[fd];
+                }
+            });
+        }
+    } catch (e) {}
+
+    // --- N3) strstr bypass ---
+    try {
+        var strstr_ptr = Module.findExportByName(libc, "strstr");
+        if (strstr_ptr) {
+            Interceptor.attach(strstr_ptr, {
+                onEnter: function (args) {
+                    if (args[1].isNull()) return;
+                    try {
+                        var needle = args[1].readUtf8String();
+                        if (needle) {
+                            var nl = needle.toLowerCase();
+                            for (var i = 0; i < fridaKeywords.length; i++) {
+                                if (nl.indexOf(fridaKeywords[i]) !== -1) {
+                                    this.shouldBlock = true;
+                                    logTrigger("STRSTR", "strstr blocked: " + needle);
+                                    break;
+                                }
+                            }
+                        }
+                    } catch (e) {}
+                },
+                onLeave: function (retval) {
+                    if (this.shouldBlock) {
+                        retval.replace(ptr(0)); // NULL = not found
+                    }
+                }
+            });
+            hookOk("N3", "strstr() frida keyword blocking");
+        }
+    } catch (e) { hookFail("N3", "strstr", e); }
+
+    // --- N4) __system_property_get ---
+    try {
+        var prop_get = Module.findExportByName(libc, "__system_property_get");
+        if (prop_get) {
+            Interceptor.attach(prop_get, {
+                onEnter: function (args) {
+                    this.name = args[0].readUtf8String();
+                    this.valueBuf = args[1];
+                },
+                onLeave: function (retval) {
+                    if (this.name === "ro.debuggable") {
+                        this.valueBuf.writeUtf8String("0");
+                    } else if (this.name === "ro.secure") {
+                        this.valueBuf.writeUtf8String("1");
+                    } else if (this.name === "ro.build.tags") {
+                        this.valueBuf.writeUtf8String("release-keys");
+                    } else if (this.name === "service.adb.root") {
+                        this.valueBuf.writeUtf8String("0");
+                    }
+                }
+            });
+            hookOk("N4", "__system_property_get spoofing");
+        }
+    } catch (e) { hookFail("N4", "property spoofing", e); }
+
+    // --- N5) ptrace ---
+    try {
+        var ptrace_ptr = Module.findExportByName(libc, "ptrace");
+        if (ptrace_ptr) {
+            Interceptor.replace(ptrace_ptr, new NativeCallback(function (req, pid, addr, data) {
+                logTrigger("PTRACE", "ptrace(" + req + ") -> 0");
+                return 0;
+            }, "int", ["int", "int", "pointer", "pointer"]));
+            hookOk("N5", "ptrace() -> 0");
+        }
+    } catch (e) { hookFail("N5", "ptrace", e); }
+
+    // --- N6) access() for root files ---
+    var nativeRootPaths = [
+        "/system/app/Superuser.apk", "/sbin/su", "/system/bin/su",
+        "/system/xbin/su", "/data/local/xbin/su", "/data/local/bin/su",
+        "/su/bin/su", "/system/xbin/daemonsu", "/sbin/.magisk",
+        "/data/adb/magisk", "/system/framework/XposedBridge.jar",
+        "/cache/recovery/xposed.zip"
+    ];
+    try {
+        var access_ptr = Module.findExportByName(libc, "access");
+        if (access_ptr) {
+            Interceptor.attach(access_ptr, {
+                onEnter: function (args) {
+                    try {
+                        var p = args[0].readUtf8String();
+                        if (p) {
+                            for (var i = 0; i < nativeRootPaths.length; i++) {
+                                if (p.indexOf(nativeRootPaths[i]) !== -1) {
+                                    this.blockIt = true;
+                                    logTrigger("ACCESS", "access() blocked: " + p);
+                                    break;
+                                }
+                            }
+                        }
+                    } catch (e) {}
+                },
+                onLeave: function (retval) {
+                    if (this.blockIt) retval.replace(-1);
+                }
+            });
+            hookOk("N6", "access() root path blocking");
+        }
+    } catch (e) { hookFail("N6", "access", e); }
+
+    // --- N7) stat() for root files ---
+    try {
+        var stat_ptr = Module.findExportByName(libc, "stat");
+        if (stat_ptr) {
+            Interceptor.attach(stat_ptr, {
+                onEnter: function (args) {
+                    try {
+                        var p = args[0].readUtf8String();
+                        if (p) {
+                            for (var i = 0; i < nativeRootPaths.length; i++) {
+                                if (p.indexOf(nativeRootPaths[i]) !== -1) {
+                                    this.blockIt = true;
+                                    break;
+                                }
+                            }
+                        }
+                    } catch (e) {}
+                },
+                onLeave: function (retval) {
+                    if (this.blockIt) retval.replace(-1);
+                }
+            });
+            hookOk("N7", "stat() root path blocking");
+        }
+    } catch (e) { hookFail("N7", "stat", e); }
+
+    // --- N8) dlopen monitoring for security libs ---
+    try {
+        var dlopen_ptr = Module.findExportByName(null, "android_dlopen_ext") ||
+                         Module.findExportByName(null, "dlopen");
+        if (dlopen_ptr) {
+            Interceptor.attach(dlopen_ptr, {
+                onEnter: function (args) {
+                    if (args[0] && !args[0].isNull()) {
+                        try {
+                            var name = args[0].readUtf8String();
+                            if (name && (name.indexOf("calcifer") !== -1 || name.indexOf("iproov") !== -1)) {
+                                logTrigger("DLOPEN", "Security lib: " + name);
+                                this.secLib = name;
+                            }
+                        } catch (e) {}
+                    }
+                },
+                onLeave: function (retval) {
+                    if (this.secLib && this.secLib.indexOf("calcifer") !== -1) {
+                        hookCalciferDelayed();
+                    }
+                }
+            });
+            hookOk("N8", "dlopen() security lib monitoring");
+        }
+    } catch (e) { hookFail("N8", "dlopen", e); }
+
+    log("NATIVE", "=== Native hooks: " + hookStats.installed + " OK, " + hookStats.failed + " failed ===");
+}
+
+// ============================================================
+// PHASE 2: JAVA HOOKS (delayed to avoid Thread bug on Android 15)
+// ============================================================
+function installJavaHooks() {
+
+    // === ROOT DETECTION ===
+    log("ROOT", "=== Bypassing root detection ===");
+
+    var rootPaths = [
+        "/system/app/Superuser.apk", "/sbin/su", "/system/bin/su",
+        "/system/xbin/su", "/data/local/xbin/su", "/data/local/bin/su",
+        "/system/sd/xbin/su", "/system/bin/failsafe/su", "/data/local/su",
+        "/su/bin/su", "/su/bin", "/system/xbin/daemonsu",
+        "/sbin/.magisk", "/sbin/.magisk/modules", "/data/adb/magisk",
+        "/data/magisk", "/magisk/.core/bin/",
+        "/system/framework/XposedBridge.jar",
+        "/cache/recovery/xposed.zip",
+        "/data/adb/modules/riru_lsposed",
+        "/sbin/.magisk/modules/riru_lsposed"
+    ];
+
+    // R1: File.exists
+    try {
+        var File = Java.use("java.io.File");
+        File.exists.implementation = function () {
+            var path = this.getAbsolutePath();
+            for (var i = 0; i < rootPaths.length; i++) {
+                if (path === rootPaths[i]) {
+                    logTrigger("ROOT", "File.exists blocked: " + path);
+                    return false;
+                }
+            }
+            return this.exists();
+        };
+        hookOk("R1", "File.exists() (" + rootPaths.length + " paths)");
+    } catch (e) { hookFail("R1", "File.exists", e); }
+
     var rootPackages = [
         "com.noshufou.android.su", "com.noshufou.android.su.elite",
         "eu.chainfire.supersu", "com.koushikdutta.superuser",
@@ -115,785 +465,466 @@ function bypassRootDetection() {
         "de.robv.android.xposed.installer",
         "com.saurik.substrate",
         "com.zachspong.temprootremovejb",
-        "com.amphoras.hidemyroot",
-        "com.formyhm.hideroot",
+        "com.amphoras.hidemyroot", "com.formyhm.hideroot",
         "org.lsposed.manager", "moe.lsposed"
     ];
 
-    var PackageManager = Java.use("android.content.pm.PackageManager");
-    var NameNotFoundException = Java.use("android.content.pm.PackageManager$NameNotFoundException");
-
-    // getPackageInfo(String, int)
-    PackageManager.getPackageInfo.overload("java.lang.String", "int").implementation = function (pkgName, flags) {
-        for (var i = 0; i < rootPackages.length; i++) {
-            if (pkgName === rootPackages[i]) {
-                logDetection("ROOT_PKG", "getPackageInfo blocked: " + pkgName);
-                throw NameNotFoundException.$new(pkgName);
-            }
-        }
-        return this.getPackageInfo(pkgName, flags);
-    };
-
-    // getPackageInfo(String, PackageInfoFlags) - Android 13+
+    // R2: PackageManager
     try {
-        PackageManager.getPackageInfo.overload("java.lang.String", "android.content.pm.PackageManager$PackageInfoFlags").implementation = function (pkgName, flags) {
+        var PM = Java.use("android.app.ApplicationPackageManager");
+        var NNFE = Java.use("android.content.pm.PackageManager$NameNotFoundException");
+        PM.getPackageInfo.overload("java.lang.String", "int").implementation = function (pkg, flags) {
             for (var i = 0; i < rootPackages.length; i++) {
-                if (pkgName === rootPackages[i]) {
-                    logDetection("ROOT_PKG", "getPackageInfo(flags) blocked: " + pkgName);
-                    throw NameNotFoundException.$new(pkgName);
+                if (pkg === rootPackages[i]) {
+                    logTrigger("ROOT", "getPackageInfo blocked: " + pkg);
+                    throw NNFE.$new(pkg);
                 }
             }
-            return this.getPackageInfo(pkgName, flags);
+            return this.getPackageInfo(pkg, flags);
         };
-    } catch (e) {
-        log("ROOT", "Android 13+ PackageInfoFlags overload not available (OK on older Android)");
-    }
+        hookOk("R2", "PackageManager root blocking");
+    } catch (e) { hookFail("R2", "PackageManager", e); }
 
-    // --- 1c) Runtime.exec bypass for 'su', 'which su', 'getprop', 'mount' ---
-    var Runtime = Java.use("java.lang.Runtime");
-
-    Runtime.exec.overload("[Ljava.lang.String;").implementation = function (cmdArray) {
-        var cmd = cmdArray.join(" ");
-        if (cmd.indexOf("su") !== -1 || cmd.indexOf("which") !== -1) {
-            logDetection("ROOT_EXEC", "Runtime.exec blocked: " + cmd);
-            throw Java.use("java.io.IOException").$new("Permission denied");
-        }
-        return this.exec(cmdArray);
-    };
-
-    Runtime.exec.overload("java.lang.String").implementation = function (cmd) {
-        if (cmd.indexOf("/system/xbin/which") !== -1 && cmd.indexOf("su") !== -1) {
-            logDetection("ROOT_EXEC", "Runtime.exec blocked: " + cmd);
-            throw Java.use("java.io.IOException").$new("Permission denied");
-        }
-        // Spoof 'getprop' to remove root indicators
-        if (cmd === "getprop") {
-            logDetection("ROOT_PROP", "getprop intercepted - spoofing output");
-        }
-        return this.exec(cmd);
-    };
-
-    // --- 1d) Build.TAGS bypass (test-keys -> release-keys) ---
-    var Build = Java.use("android.os.Build");
-    var fieldTags = Build.class.getDeclaredField("TAGS");
-    fieldTags.setAccessible(true);
-    fieldTags.set(null, Java.use("java.lang.String").$new("release-keys"));
-    log("ROOT", "Build.TAGS spoofed to 'release-keys'");
-
-    // --- 1e) System properties bypass ---
+    // R3: Runtime.exec
     try {
-        var SystemProperties = Java.use("android.os.SystemProperties");
-        var origGet = SystemProperties.get.overload("java.lang.String");
-        SystemProperties.get.overload("java.lang.String").implementation = function (key) {
-            if (key === "ro.debuggable") {
-                logDetection("ROOT_PROP", "ro.debuggable spoofed to 0");
-                return "0";
+        var Runtime = Java.use("java.lang.Runtime");
+        Runtime.exec.overload("java.lang.String").implementation = function (cmd) {
+            if ((cmd.indexOf("/system/xbin/which") !== -1 && cmd.indexOf("su") !== -1) ||
+                cmd === "su" || cmd.indexOf("/su ") !== -1) {
+                logTrigger("ROOT", "Runtime.exec blocked: " + cmd);
+                throw Java.use("java.io.IOException").$new("Permission denied");
             }
-            if (key === "ro.secure") {
-                logDetection("ROOT_PROP", "ro.secure spoofed to 1");
-                return "1";
-            }
-            if (key === "ro.build.tags") {
-                logDetection("ROOT_PROP", "ro.build.tags spoofed to release-keys");
-                return "release-keys";
-            }
-            if (key === "service.adb.root") {
-                logDetection("ROOT_PROP", "service.adb.root spoofed to 0");
-                return "0";
-            }
-            return origGet.call(this, key);
+            return this.exec(cmd);
         };
+        Runtime.exec.overload("[Ljava.lang.String;").implementation = function (arr) {
+            var cmd = arr.join(" ");
+            if (cmd === "su" || cmd.indexOf("/su") !== -1 ||
+                (cmd.indexOf("which") !== -1 && cmd.indexOf("su") !== -1)) {
+                logTrigger("ROOT", "Runtime.exec[] blocked: " + cmd);
+                throw Java.use("java.io.IOException").$new("Permission denied");
+            }
+            return this.exec(arr);
+        };
+        hookOk("R3", "Runtime.exec su/which blocking");
+    } catch (e) { hookFail("R3", "Runtime.exec", e); }
 
-        var origGet2 = SystemProperties.get.overload("java.lang.String", "java.lang.String");
-        SystemProperties.get.overload("java.lang.String", "java.lang.String").implementation = function (key, def) {
+    // R4: Build.TAGS
+    try {
+        var Build = Java.use("android.os.Build");
+        var f = Build.class.getDeclaredField("TAGS");
+        f.setAccessible(true);
+        f.set(null, Java.use("java.lang.String").$new("release-keys"));
+        hookOk("R4", "Build.TAGS -> release-keys");
+    } catch (e) { hookFail("R4", "Build.TAGS", e); }
+
+    // R5: SystemProperties
+    try {
+        var SP = Java.use("android.os.SystemProperties");
+        SP.get.overload("java.lang.String").implementation = function (key) {
             if (key === "ro.debuggable") return "0";
             if (key === "ro.secure") return "1";
             if (key === "ro.build.tags") return "release-keys";
             if (key === "service.adb.root") return "0";
-            return origGet2.call(this, key, def);
+            return this.get(key);
         };
-    } catch (e) {
-        log("ROOT", "SystemProperties hook failed (non-critical): " + e);
-    }
+        SP.get.overload("java.lang.String", "java.lang.String").implementation = function (key, def) {
+            if (key === "ro.debuggable") return "0";
+            if (key === "ro.secure") return "1";
+            if (key === "ro.build.tags") return "release-keys";
+            if (key === "service.adb.root") return "0";
+            return this.get(key, def);
+        };
+        hookOk("R5", "SystemProperties spoofing");
+    } catch (e) { hookFail("R5", "SystemProperties", e); }
 
-    // --- 1f) Bitso-specific isRootedDevice bypass (LA.a interface) ---
-    // The app checks root via LA.a.invoke() -> used in RA.b (lifecycle observer)
-    // and OA.e (show rooted device alert decision)
+    // R6: SplashActivity root check
     try {
-        var SplashActivity = Java.use("com.bitso.wallet.onboarding.splash.SplashActivity");
-        SplashActivity.B0.implementation = function (isRooted) {
-            logDetection("ROOT_BITSO", "SplashActivity.checkRootedDeviceDecision called with: " + isRooted + " -> forcing false");
+        var SA = Java.use("com.bitso.wallet.onboarding.splash.SplashActivity");
+        SA.B0.implementation = function (isRooted) {
+            logTrigger("ROOT", "SplashActivity root check -> false");
             this.B0(false);
         };
-    } catch (e) {
-        log("ROOT", "SplashActivity hook failed: " + e);
-    }
+        hookOk("R6", "SplashActivity.B0");
+    } catch (e) { hookFail("R6", "SplashActivity", e); }
 
-    // --- 1g) Sentry root checker bypass ---
+    // R7: Sentry root checker (try both obfuscated and non-obfuscated)
     try {
-        var SentryRootChecker = Java.use("io.sentry.android.core.internal.util.m");
-        SentryRootChecker.e.implementation = function () {
-            logDetection("ROOT_SENTRY", "Sentry root check -> returning false");
+        var SR = Java.use("io.sentry.android.core.internal.util.RootChecker");
+        SR.isDeviceRooted.implementation = function () {
+            logTrigger("ROOT", "Sentry isDeviceRooted -> false");
             return false;
         };
+        hookOk("R7", "Sentry RootChecker");
     } catch (e) {
-        log("ROOT", "Sentry root checker hook not found: " + e);
+        try {
+            var SR2 = Java.use("io.sentry.android.core.internal.util.m");
+            SR2.e.implementation = function () {
+                logTrigger("ROOT", "Sentry root (obfuscated) -> false");
+                return false;
+            };
+            hookOk("R7b", "Sentry root (obfuscated)");
+        } catch (e2) { hookFail("R7", "Sentry", e2); }
     }
 
-    // --- 1h) Sift Science root data collection bypass ---
+    // R8: SiftScience
     try {
-        var SiftCollector = Java.use("siftscience.android.DevicePropertiesCollector");
-        SiftCollector.collect.implementation = function () {
-            logDetection("ROOT_SIFT", "Sift Science device properties collection intercepted");
-            // Still call it but the File.exists and PackageManager hooks above will return clean data
-            this.collect();
-        };
-    } catch (e) {
-        log("ROOT", "Sift Science hook not available: " + e);
-    }
+        var Sift = Java.use("siftscience.android.DevicePropertiesCollector");
+        try {
+            Sift.existingRootFiles.implementation = function () {
+                logTrigger("ROOT", "SiftScience rootFiles -> empty");
+                return Java.use("java.util.ArrayList").$new();
+            };
+        } catch (e2) {}
+        try {
+            Sift.existingRootPackages.implementation = function () {
+                logTrigger("ROOT", "SiftScience rootPackages -> empty");
+                return Java.use("java.util.ArrayList").$new();
+            };
+        } catch (e2) {}
+        try {
+            Sift.existingDangerousProperties.implementation = function () {
+                return Java.use("java.util.ArrayList").$new();
+            };
+        } catch (e2) {}
+        try {
+            Sift.existingRWPaths.implementation = function () {
+                return Java.use("java.util.ArrayList").$new();
+            };
+        } catch (e2) {}
+        hookOk("R8", "SiftScience root detection");
+    } catch (e) { hookFail("R8", "SiftScience", e); }
 
-    log("ROOT", "Root detection bypass initialized - " + rootPaths.length + " paths, " + rootPackages.length + " packages monitored");
-}
-
-// ============================================================
-// 2) FRIDA DETECTION BYPASS
-// ============================================================
-function bypassFridaDetection() {
-    log("FRIDA", "Initializing Frida detection bypass...");
-
-    // --- 2a) /proc/self/maps hiding ---
-    var fopen = Module.findExportByName("libc.so", "fopen");
-    if (fopen) {
-        Interceptor.attach(fopen, {
-            onEnter: function (args) {
-                this.path = args[0].readUtf8String();
-            },
-            onLeave: function (retval) {
-                if (this.path && this.path.indexOf("/proc/self/maps") !== -1) {
-                    logDetection("FRIDA_MAPS", "/proc/self/maps access detected");
-                }
-            }
-        });
-    }
-
-    // Intercept read to filter frida-related entries from /proc/self/maps
-    var pread = Module.findExportByName("libc.so", "read");
-    // We'll use a different approach - hook strstr to prevent frida string matching
-    var strstr = Module.findExportByName("libc.so", "strstr");
-    if (strstr) {
-        var fridaStrings = [
-            "frida", "gadget", "linjector", "agent", "gmain",
-            "gdbus", "gum-js-loop", "frida-agent",
-            "frida-server", "frida-gadget"
-        ];
-        Interceptor.attach(strstr, {
-            onEnter: function (args) {
-                if (args[1] !== null) {
+    // R9: SharedPreferences root data source
+    try {
+        // Search for rooted device check data source classes
+        Java.enumerateLoadedClasses({
+            onMatch: function (name) {
+                if (name.indexOf("RootedDeviceCheckDataSource") !== -1) {
                     try {
-                        var needle = args[1].readUtf8String();
-                        if (needle) {
-                            var nl = needle.toLowerCase();
-                            for (var i = 0; i < fridaStrings.length; i++) {
-                                if (nl.indexOf(fridaStrings[i]) !== -1) {
-                                    logDetection("FRIDA_STRSTR", "strstr search for: " + needle);
-                                    // Replace needle with empty string to prevent match
-                                    args[1] = Memory.allocUtf8String("XXXXXXXXXXXXXXX");
-                                    break;
-                                }
+                        var cls = Java.use(name);
+                        var methods = cls.class.getDeclaredMethods();
+                        for (var i = 0; i < methods.length; i++) {
+                            var m = methods[i];
+                            if (m.getReturnType().getName() === "boolean") {
+                                var mName = m.getName();
+                                cls[mName].implementation = function () {
+                                    logTrigger("ROOT", "RootedDeviceCheckDataSource -> false");
+                                    return false;
+                                };
+                                hookOk("R9", "SharedPref root check: " + name + "." + mName);
+                                break;
                             }
                         }
-                    } catch (e) {}
+                    } catch (e3) {}
                 }
-            }
+            },
+            onComplete: function () {}
         });
-    }
+    } catch (e) {}
 
-    // --- 2b) Port 27042 detection bypass (default frida-server port) ---
-    var connect = Module.findExportByName("libc.so", "connect");
-    if (connect) {
-        Interceptor.attach(connect, {
-            onEnter: function (args) {
-                var sockAddr = args[1];
-                var family = sockAddr.readU16();
-                if (family === 2) { // AF_INET
-                    var port = (sockAddr.add(2).readU8() << 8) | sockAddr.add(3).readU8();
-                    if (port === 27042 || port === 27043) {
-                        logDetection("FRIDA_PORT", "Connection to frida port " + port + " detected");
-                    }
-                }
-            }
-        });
-    }
+    // === SSL PINNING (lightweight) ===
+    log("SSL", "=== Bypassing SSL pinning (lightweight - internet stays working) ===");
 
-    // --- 2c) /proc/self/fd enumeration bypass ---
-    var opendir = Module.findExportByName("libc.so", "opendir");
-    if (opendir) {
-        Interceptor.attach(opendir, {
-            onEnter: function (args) {
-                var path = args[0].readUtf8String();
-                if (path && (path.indexOf("/proc/self/fd") !== -1 || path.indexOf("/proc/self/task") !== -1)) {
-                    logDetection("FRIDA_PROC", "Process enumeration: " + path);
-                }
-            }
-        });
-    }
-
-    // --- 2d) /proc/self/task/*/status TracerPid bypass ---
-    var orig_fgets = Module.findExportByName("libc.so", "fgets");
-    if (orig_fgets) {
-        Interceptor.attach(orig_fgets, {
-            onLeave: function (retval) {
-                if (retval.isNull()) return;
-                try {
-                    var line = retval.readUtf8String();
-                    if (line && line.indexOf("TracerPid:") !== -1) {
-                        var cleaned = "TracerPid:\t0\n";
-                        retval.writeUtf8String(cleaned);
-                        logDetection("FRIDA_TRACER", "TracerPid spoofed to 0");
-                    }
-                } catch (e) {}
-            }
-        });
-    }
-
-    // --- 2e) dlopen/dlsym detection for frida modules ---
-    var dlopen = Module.findExportByName(null, "dlopen");
-    if (dlopen) {
-        Interceptor.attach(dlopen, {
-            onEnter: function (args) {
-                if (args[0] !== null) {
-                    var name = args[0].readUtf8String();
-                    if (name && (name.indexOf("frida") !== -1 || name.indexOf("gadget") !== -1)) {
-                        logDetection("FRIDA_DLOPEN", "dlopen for: " + name);
-                    }
-                }
-            }
-        });
-    }
-
-    log("FRIDA", "Frida detection bypass initialized");
-}
-
-// ============================================================
-// 3) SSL PINNING BYPASS (lightweight - does NOT break connectivity)
-// ============================================================
-function bypassSSLPinning() {
-    log("SSL", "Initializing SSL pinning bypass (lightweight mode)...");
-
-    // --- 3a) OkHttp CertificatePinner.check() - make it a no-op ---
-    // IMPORTANT: We only skip the CHECK, we do NOT touch Builder.add().
-    // Removing pins from the builder breaks OkHttp's TLS handshake entirely.
+    // S1: CertificatePinner.check -> no-op (DO NOT touch Builder.add)
     try {
-        var CertificatePinner = Java.use("okhttp3.CertificatePinner");
-        CertificatePinner.check.overload("java.lang.String", "java.util.List").implementation = function (hostname, peerCertificates) {
-            logDetection("SSL_OKHTTP", "CertificatePinner.check bypassed for: " + hostname);
-            // Do nothing - skip pin validation but connection stays alive
+        var CP = Java.use("okhttp3.CertificatePinner");
+        CP.check.overload("java.lang.String", "java.util.List").implementation = function (host, certs) {
+            logTrigger("SSL", "CertificatePinner.check bypassed: " + host);
         };
         try {
-            CertificatePinner["check$okhttp"].implementation = function (hostname, cleanedCerts) {
-                logDetection("SSL_OKHTTP", "CertificatePinner.check$okhttp bypassed for: " + hostname);
+            CP["check$okhttp"].implementation = function (host, fn) {
+                logTrigger("SSL", "CertificatePinner.check$okhttp bypassed: " + host);
             };
-        } catch (e2) {
-            log("SSL", "check$okhttp not found (OK - older OkHttp): " + e2);
-        }
-        log("SSL", "[1] OkHttp CertificatePinner.check() -> no-op (pins still added, just not enforced)");
-    } catch (e) {
-        log("SSL", "OkHttp CertificatePinner hook: " + e);
-    }
+        } catch (e2) {}
+        hookOk("S1", "OkHttp CertificatePinner.check -> no-op");
+    } catch (e) { hookFail("S1", "CertificatePinner", e); }
 
-    // --- 3b) Android platform TrustManagerImpl (if present) ---
-    // This bypasses system-level cert validation without replacing the global SSLSocketFactory
+    // S2: Conscrypt TrustManagerImpl
     try {
-        var TrustManagerImpl = Java.use("com.android.org.conscrypt.TrustManagerImpl");
-        TrustManagerImpl.verifyChain.implementation = function (untrustedChain, trustAnchorChain, host, clientAuth, ocspData, tlsSctData) {
-            logDetection("SSL_CONSCRYPT", "TrustManagerImpl.verifyChain bypassed for: " + host);
-            return untrustedChain;
+        var TMI = Java.use("com.android.org.conscrypt.TrustManagerImpl");
+        TMI.verifyChain.implementation = function (untrusted, anchors, host, clientAuth, ocsp, tlsSct) {
+            logTrigger("SSL", "TrustManagerImpl.verifyChain bypassed: " + host);
+            return untrusted;
         };
-        log("SSL", "[2] Conscrypt TrustManagerImpl.verifyChain() bypassed");
-    } catch (e) {
-        log("SSL", "TrustManagerImpl hook (non-critical): " + e);
-    }
+        hookOk("S2", "Conscrypt TrustManagerImpl");
+    } catch (e) { hookFail("S2", "TrustManagerImpl", e); }
 
-    // --- 3c) Network security config trust anchors ---
-    // Hook the NetworkSecurityConfig to accept all certificates
+    // S3: NetworkSecurityTrustManager
     try {
-        var NetworkSecurityTrustManager = Java.use("android.security.net.config.NetworkSecurityTrustManager");
-        NetworkSecurityTrustManager.checkServerTrusted.overload("[Ljava.security.cert.X509Certificate;", "java.lang.String").implementation = function (certs, authType) {
-            logDetection("SSL_NETSEC", "NetworkSecurityTrustManager.checkServerTrusted bypassed");
+        var NSTM = Java.use("android.security.net.config.NetworkSecurityTrustManager");
+        NSTM.checkServerTrusted.overload("[Ljava.security.cert.X509Certificate;", "java.lang.String").implementation = function (certs, authType) {
+            logTrigger("SSL", "NetworkSecurityTrustManager bypassed");
         };
-        log("SSL", "[3] NetworkSecurityTrustManager bypassed");
-    } catch (e) {
-        log("SSL", "NetworkSecurityTrustManager hook (non-critical): " + e);
-    }
+        hookOk("S3", "NetworkSecurityTrustManager");
+    } catch (e) { hookFail("S3", "NetworkSecurityTrustManager", e); }
 
-    // --- 3d) OkHttp HostnameVerifier ---
+    // S4: OkHostnameVerifier
     try {
-        var OkHostnameVerifier = Java.use("okhttp3.internal.tls.OkHostnameVerifier");
-        OkHostnameVerifier.verify.overload("java.lang.String", "javax.net.ssl.SSLSession").implementation = function (hostname, session) {
-            logDetection("SSL_HOSTNAME", "OkHostnameVerifier.verify bypassed for: " + hostname);
+        var OHV = Java.use("okhttp3.internal.tls.OkHostnameVerifier");
+        OHV.verify.overload("java.lang.String", "javax.net.ssl.SSLSession").implementation = function (host, session) {
+            logTrigger("SSL", "OkHostnameVerifier bypassed: " + host);
             return true;
         };
-        log("SSL", "[4] OkHostnameVerifier bypassed");
-    } catch (e) {
-        log("SSL", "OkHostnameVerifier hook (non-critical): " + e);
-    }
+        hookOk("S4", "OkHostnameVerifier");
+    } catch (e) { hookFail("S4", "OkHostnameVerifier", e); }
 
-    // --- 3e) WebViewClient SSL error bypass ---
+    // S5: WebViewClient SSL error
     try {
-        var WebViewClient = Java.use("android.webkit.WebViewClient");
-        WebViewClient.onReceivedSslError.implementation = function (view, handler, error) {
-            logDetection("SSL_WEBVIEW", "WebView SSL error bypassed: " + error.toString());
+        var WVC = Java.use("android.webkit.WebViewClient");
+        WVC.onReceivedSslError.implementation = function (view, handler, error) {
+            logTrigger("SSL", "WebView SSL error bypassed");
             handler.proceed();
         };
-        log("SSL", "[5] WebViewClient SSL error bypass applied");
-    } catch (e) {
-        log("SSL", "WebViewClient hook: " + e);
-    }
+        hookOk("S5", "WebViewClient SSL");
+    } catch (e) { hookFail("S5", "WebViewClient", e); }
 
-    // NOTE: We intentionally do NOT:
-    // - Replace the global SSLSocketFactory (breaks all HTTPS)
-    // - Replace the global HostnameVerifier (breaks all HTTPS)
-    // - Neutralize CertificatePinner.Builder.add() (breaks OkHttp client setup)
-    // These aggressive approaches cause "no internet" issues.
-
-    log("SSL", "SSL pinning bypass initialized (lightweight - internet should work)");
-}
-
-// ============================================================
-// 4) EMULATOR DETECTION BYPASS
-// ============================================================
-function bypassEmulatorDetection() {
-    log("EMU", "Initializing emulator detection bypass...");
-
-    // --- 4a) Build properties spoofing ---
-    var Build = Java.use("android.os.Build");
-    var fields = {
-        "PRODUCT": "walleye",
-        "HARDWARE": "walleye",
-        "MANUFACTURER": "Google",
-        "MODEL": "Pixel 2",
-        "BRAND": "google",
-        "DEVICE": "walleye",
-        "BOARD": "walleye",
-        "FINGERPRINT": "google/walleye/walleye:11/RP1A.200720.009/6720564:user/release-keys",
-        "HOST": "abfarm-release-rbe-64-00",
-        "DISPLAY": "RP1A.200720.009"
-    };
-
-    for (var fname in fields) {
-        try {
-            var f = Build.class.getDeclaredField(fname);
-            f.setAccessible(true);
-            f.set(null, Java.use("java.lang.String").$new(fields[fname]));
-        } catch (e) {}
-    }
-    log("EMU", "Build properties spoofed");
-
-    // --- 4b) idwall SDK emulator detector bypass ---
-    // k3.C12435a - combines remoteEmulatorDetector, localEmulatorDetector, rootDetector
+    // S6: HttpsURLConnection hostname verifier (lightweight - only intercept set, don't replace global)
     try {
-        var IdwallDetector = Java.use("k3.C12435a");
-        IdwallDetector.a.implementation = function () {
-            logDetection("EMU_IDWALL", "idwall device integrity check -> returning 0 (clean)");
-            return 0;
+        var HSURLC = Java.use("javax.net.ssl.HttpsURLConnection");
+        HSURLC.setDefaultHostnameVerifier.implementation = function (verifier) {
+            logTrigger("SSL", "HttpsURLConnection.setDefaultHostnameVerifier intercepted");
+            // Let it through - don't block, just log
+            this.setDefaultHostnameVerifier(verifier);
         };
-    } catch (e) {
-        log("EMU", "idwall detector hook: " + e);
-    }
+        hookOk("S6", "HttpsURLConnection monitoring");
+    } catch (e) { hookFail("S6", "HttpsURLConnection", e); }
 
-    // --- 4c) Jumio SDK isRooted bypass ---
+    // === EMULATOR DETECTION ===
+    log("EMU", "=== Bypassing emulator detection ===");
+
     try {
-        var JumioSDK = Java.use("com.jumio.sdk.JumioSDK$Companion");
-        JumioSDK.isRooted.implementation = function (context) {
-            logDetection("EMU_JUMIO", "Jumio SDK isRooted -> returning false");
+        var Build2 = Java.use("android.os.Build");
+        var props = {
+            "PRODUCT": "walleye", "HARDWARE": "walleye",
+            "MANUFACTURER": "Google", "MODEL": "Pixel 2",
+            "BRAND": "google", "DEVICE": "walleye", "BOARD": "walleye",
+            "FINGERPRINT": "google/walleye/walleye:11/RP1A.200720.009/6720564:user/release-keys"
+        };
+        for (var k in props) {
+            try {
+                var ff = Build2.class.getDeclaredField(k);
+                ff.setAccessible(true);
+                ff.set(null, Java.use("java.lang.String").$new(props[k]));
+            } catch (e2) {}
+        }
+        hookOk("E1", "Build properties spoofed");
+    } catch (e) { hookFail("E1", "Build props", e); }
+
+    // E2: Jumio
+    try {
+        var Jumio = Java.use("com.jumio.sdk.JumioSDK$Companion");
+        Jumio.isRooted.implementation = function (ctx) {
+            logTrigger("EMU", "Jumio isRooted -> false");
             return false;
         };
-    } catch (e) {
-        log("EMU", "Jumio SDK isRooted hook: " + e);
-    }
+        hookOk("E2", "Jumio isRooted");
+    } catch (e) { hookFail("E2", "Jumio", e); }
 
-    log("EMU", "Emulator detection bypass initialized");
-}
+    // === DEBUGGER DETECTION ===
+    log("DEBUG", "=== Bypassing debugger detection ===");
 
-// ============================================================
-// 5) DEBUGGER DETECTION BYPASS
-// ============================================================
-function bypassDebuggerDetection() {
-    log("DEBUG", "Initializing debugger detection bypass...");
-
-    // --- 5a) Debug.isDebuggerConnected bypass ---
     try {
-        var Debug = Java.use("android.os.Debug");
-        Debug.isDebuggerConnected.implementation = function () {
-            logDetection("DEBUG_CHECK", "Debug.isDebuggerConnected -> false");
-            return false;
-        };
-    } catch (e) {
-        log("DEBUG", "Debug.isDebuggerConnected hook: " + e);
-    }
+        var Dbg = Java.use("android.os.Debug");
+        Dbg.isDebuggerConnected.implementation = function () { return false; };
+        Dbg.waitingForDebugger.implementation = function () { return false; };
+        hookOk("D1", "Debug.isDebuggerConnected + waitingForDebugger");
+    } catch (e) { hookFail("D1", "Debug", e); }
 
-    // --- 5b) ApplicationInfo flags bypass ---
+    // === FRIDA DETECTION (Java) ===
+    log("FRIDA", "=== Bypassing Frida detection (Java) ===");
+
     try {
-        var ApplicationInfo = Java.use("android.content.pm.ApplicationInfo");
-        var origFlags = ApplicationInfo.flags;
-        // Remove FLAG_DEBUGGABLE (0x2) if present
-    } catch (e) {}
-
-    // --- 5c) ptrace bypass ---
-    var ptrace = Module.findExportByName("libc.so", "ptrace");
-    if (ptrace) {
-        Interceptor.attach(ptrace, {
-            onEnter: function (args) {
-                logDetection("DEBUG_PTRACE", "ptrace called with request: " + args[0]);
-            },
-            onLeave: function (retval) {
-                retval.replace(0);
+        var CL = Java.use("java.lang.ClassLoader");
+        CL.loadClass.overload("java.lang.String").implementation = function (name) {
+            if (name === "de.robv.android.xposed.XposedBridge" ||
+                name === "de.robv.android.xposed.XC_MethodHook" ||
+                name === "com.saurik.substrate.MS") {
+                logTrigger("FRIDA", "Xposed/Substrate class load blocked: " + name);
+                throw Java.use("java.lang.ClassNotFoundException").$new(name);
             }
-        });
-    }
-
-    log("DEBUG", "Debugger detection bypass initialized");
-}
-
-// ============================================================
-// 6) PLAY INTEGRITY BYPASS
-// ============================================================
-function bypassPlayIntegrity() {
-    log("INTEGRITY", "Initializing Play Integrity bypass...");
-
-    // --- 6a) IntegrityManager token request interception ---
-    try {
-        var IntegrityPc = Java.use("k3.Pc");
-
-        // Hook the save device integrity method to always save clean data
-        IntegrityPc.e.implementation = function (context, token, errorCode, integrityErrorCode) {
-            logDetection("INTEGRITY", "Device integrity save intercepted - errorCode: " + errorCode + ", token present: " + (token !== null));
-            // Call original but log the interaction
-            this.e(context, token, errorCode, integrityErrorCode);
+            return this.loadClass(name);
         };
-    } catch (e) {
-        log("INTEGRITY", "Play Integrity hook: " + e);
-    }
+        hookOk("F1", "Xposed/Substrate class blocking");
+    } catch (e) { hookFail("F1", "ClassLoader", e); }
 
-    // --- 6b) DeviceIntegrity data spoofing ---
+    // === PLAY INTEGRITY ===
+    log("INTEGRITY", "=== Monitoring Play Integrity ===");
+
     try {
-        var DeviceIntegrity = Java.use("k3.C12617n");
-        DeviceIntegrity.$init.overload("java.lang.String", "java.lang.Integer", "java.lang.String", "java.lang.Integer").implementation = function (pkg, errorCode, token, integrityErrorCode) {
-            logDetection("INTEGRITY", "DeviceIntegrity created - pkg: " + pkg + ", errorCode: " + errorCode);
-            return this.$init(pkg, errorCode, token, integrityErrorCode);
+        var IntFactory = Java.use("com.google.android.play.core.integrity.IntegrityManagerFactory");
+        IntFactory.create.implementation = function (ctx) {
+            logTrigger("INTEGRITY", "IntegrityManagerFactory.create called");
+            return this.create(ctx);
         };
-    } catch (e) {
-        log("INTEGRITY", "DeviceIntegrity hook: " + e);
-    }
+        hookOk("I1", "IntegrityManagerFactory");
+    } catch (e) { hookFail("I1", "IntegrityManagerFactory", e); }
 
-    log("INTEGRITY", "Play Integrity bypass initialized");
-}
-
-// ============================================================
-// 7) FINGERPRINTJS PRO BYPASS
-// ============================================================
-function bypassFingerprintJS() {
-    log("FPJS", "Initializing FingerprintJS Pro bypass...");
-
-    // --- 7a) Hook FingerprintJS Pro response ---
-    try {
-        var FPJSAction = Java.use("com.bitso.android.fingerprint.domain.action.GetFingerprintProDataAction");
-        // The action calls fpjs_pro.e.a(timeout, onSuccess, onError)
-        // We let it proceed normally but log the interaction
-        log("FPJS", "GetFingerprintProDataAction class loaded for monitoring");
-    } catch (e) {
-        log("FPJS", "FingerprintJS action hook: " + e);
-    }
-
-    // --- 7b) FingerprintJS Pro secrets monitoring ---
-    try {
-        var FPSecrets = Java.use("com.bitso.android.fingerprint.FingerprintProSecrets");
-        FPSecrets.e.implementation = function () {
-            var key = this.e();
-            logDetection("FPJS", "FingerprintPro API key accessed: " + key.substring(0, 8) + "...");
-            return key;
-        };
-        FPSecrets.c.implementation = function () {
-            var url = this.c();
-            logDetection("FPJS", "FingerprintPro endpoint: " + url);
-            return url;
-        };
-    } catch (e) {
-        log("FPJS", "FingerprintJS secrets hook: " + e);
-    }
-
-    log("FPJS", "FingerprintJS Pro bypass initialized");
-}
-
-// ============================================================
-// 8) iPROOV CALCIFER (NATIVE) BYPASS
-// ============================================================
-function bypassIproovCalcifer() {
-    log("IPROOV", "Initializing iProov Calcifer native bypass...");
-
-    // The libiproov-com-calcifer-lib.so has check2-check18 functions
-    // These perform native root/hook/emulator detection
+    // === FINGERPRINT JS ===
+    log("FPJS", "=== Monitoring FingerprintJS Pro ===");
 
     try {
-        var calciferLib = Module.findBaseAddress("libiproov-com-calcifer-lib.so");
-        if (calciferLib) {
-            log("IPROOV", "Calcifer library found at: " + calciferLib);
+        Java.use("com.bitso.android.fingerprint.domain.action.GetFingerprintProDataAction");
+        hookOk("FP1", "FingerprintJS Pro class found");
+    } catch (e) { hookFail("FP1", "FingerprintJS", e); }
 
-            // Hook all check functions (check2 through check18)
-            var exports = Module.enumerateExports("libiproov-com-calcifer-lib.so");
-            for (var i = 0; i < exports.length; i++) {
-                var exp = exports[i];
-                if (exp.name.match(/check\d+/) && exp.type === "function") {
-                    (function(exportName, addr) {
-                        Interceptor.attach(addr, {
-                            onEnter: function (args) {
-                                logDetection("IPROOV_CHECK", "Calcifer " + exportName + " called");
-                            },
-                            onLeave: function (retval) {
-                                // Return 0 (clean/no detection)
-                                retval.replace(0);
-                                log("IPROOV", exportName + " -> spoofed to 0 (clean)");
-                            }
-                        });
-                    })(exp.name, exp.address);
-                }
+    // === NETWORK ===
+    log("NET", "=== Bypassing network detection ===");
+
+    try {
+        var NI = Java.use("java.net.NetworkInterface");
+        NI.getName.implementation = function () {
+            var name = this.getName();
+            if (name === "tun0" || name === "ppp0" || name === "tap0") {
+                logTrigger("NET", "VPN interface hidden: " + name);
+                return "wlan0";
             }
-        } else {
-            log("IPROOV", "Calcifer library not yet loaded - setting up delayed hook");
-        }
-    } catch (e) {
-        log("IPROOV", "Calcifer hook error: " + e);
-    }
+            return name;
+        };
+        hookOk("NET1", "VPN interface hiding");
+    } catch (e) { hookFail("NET1", "VPN", e); }
 
-    // Delayed hook for when the library loads later
-    var dlopen_ptr = Module.findExportByName(null, "android_dlopen_ext") || Module.findExportByName(null, "dlopen");
-    if (dlopen_ptr) {
-        Interceptor.attach(dlopen_ptr, {
-            onEnter: function (args) {
-                if (args[0] !== null) {
-                    var name = args[0].readUtf8String();
-                    if (name && name.indexOf("calcifer") !== -1) {
-                        this.isCalcifer = true;
-                        log("IPROOV", "Calcifer library loading: " + name);
-                    }
-                }
-            },
-            onLeave: function (retval) {
-                if (this.isCalcifer) {
-                    hookCalciferChecks();
-                }
-            }
-        });
-    }
-
-    // Also hook libiproov-com-lib.so which reads /proc/self/maps and /proc/self/task
     try {
-        var iproovLib = Module.findBaseAddress("libiproov-com-lib.so");
-        if (iproovLib) {
-            log("IPROOV", "iProov main library found at: " + iproovLib);
-        }
-    } catch (e) {}
+        var Sys = Java.use("java.lang.System");
+        Sys.getProperty.overload("java.lang.String").implementation = function (key) {
+            if (key === "http.proxyHost" || key === "http.proxyPort" ||
+                key === "https.proxyHost" || key === "https.proxyPort") {
+                logTrigger("NET", "Proxy property hidden: " + key);
+                return null;
+            }
+            return this.getProperty(key);
+        };
+        hookOk("NET2", "Proxy detection bypass");
+    } catch (e) { hookFail("NET2", "Proxy", e); }
 
-    log("IPROOV", "iProov Calcifer bypass initialized");
+    // === WEBVIEW ===
+    log("WEBVIEW", "=== Monitoring WebView ===");
+
+    try {
+        var WV = Java.use("android.webkit.WebView");
+        WV.evaluateJavascript.implementation = function (script, cb) {
+            var sl = script.toLowerCase();
+            if (sl.indexOf("root") !== -1 || sl.indexOf("frida") !== -1 ||
+                sl.indexOf("jailbreak") !== -1 || sl.indexOf("tamper") !== -1) {
+                logTrigger("WEBVIEW", "Suspicious JS: " + script.substring(0, 100));
+            }
+            return this.evaluateJavascript(script, cb);
+        };
+        hookOk("WV1", "WebView JS monitoring");
+    } catch (e) { hookFail("WV1", "WebView", e); }
+
+    log("JAVA", "=== Java hooks complete ===");
 }
 
-function hookCalciferChecks() {
+// ============================================================
+// iProov Calcifer delayed hook
+// ============================================================
+function hookCalciferDelayed() {
     setTimeout(function () {
         try {
             var exports = Module.enumerateExports("libiproov-com-calcifer-lib.so");
+            var hooked = 0;
             for (var i = 0; i < exports.length; i++) {
                 var exp = exports[i];
                 if (exp.name.match(/check\d+/) && exp.type === "function") {
-                    (function(exportName, addr) {
+                    (function (name, addr) {
                         Interceptor.attach(addr, {
-                            onEnter: function (args) {
-                                logDetection("IPROOV_CHECK", "Calcifer " + exportName + " called (delayed)");
-                            },
                             onLeave: function (retval) {
                                 retval.replace(0);
+                                logTrigger("IPROOV", name + " -> 0");
                             }
                         });
                     })(exp.name, exp.address);
+                    hooked++;
                 }
             }
-            log("IPROOV", "Delayed Calcifer hooks installed");
+            if (hooked > 0) hookOk("CALC", "Calcifer " + hooked + " checks bypassed");
         } catch (e) {
-            log("IPROOV", "Delayed hook error: " + e);
+            hookFail("CALC", "Calcifer", e);
         }
     }, 500);
 }
 
 // ============================================================
-// 9) WEBVIEW / BROWSER-BASED DETECTION BYPASS
+// CONSOLE COMMANDS
 // ============================================================
-function bypassWebViewDetection() {
-    log("WEBVIEW", "Initializing WebView detection bypass...");
+function printStats() {
+    console.log("\n=== BYPASS STATS ===");
+    console.log("Hooks installed: " + hookStats.installed);
+    console.log("Hooks failed:    " + hookStats.failed);
+    console.log("Detections:      " + DETECTIONS.length);
+    console.log("Errors:          " + ERRORS.length);
+    console.log("====================\n");
+}
 
-    // --- 9a) The app uses Chrome Custom Tabs for login (authCore/core/action/a.java) ---
-    // We need to monitor/intercept WebView JS evaluation
-
-    try {
-        var WebView = Java.use("android.webkit.WebView");
-
-        WebView.evaluateJavascript.implementation = function (script, callback) {
-            logDetection("WEBVIEW_JS", "evaluateJavascript called, script length: " + script.length);
-            // Check if the JS is trying to detect root/frida
-            var scriptLower = script.toLowerCase();
-            if (scriptLower.indexOf("root") !== -1 || scriptLower.indexOf("frida") !== -1 ||
-                scriptLower.indexOf("jailbreak") !== -1 || scriptLower.indexOf("emulator") !== -1 ||
-                scriptLower.indexOf("tamper") !== -1 || scriptLower.indexOf("integrity") !== -1) {
-                logDetection("WEBVIEW_DETECT", "Suspicious JS detected: " + script.substring(0, 200));
-            }
-            return this.evaluateJavascript(script, callback);
-        };
-
-        WebView.loadUrl.overload("java.lang.String").implementation = function (url) {
-            if (url.startsWith("javascript:")) {
-                logDetection("WEBVIEW_JS", "loadUrl javascript: " + url.substring(0, 200));
-            } else {
-                log("WEBVIEW", "loadUrl: " + url);
-            }
-            return this.loadUrl(url);
-        };
-
-        WebView.addJavascriptInterface.implementation = function (obj, name) {
-            logDetection("WEBVIEW_IFACE", "addJavascriptInterface: " + name + " (" + obj.getClass().getName() + ")");
-            return this.addJavascriptInterface(obj, name);
-        };
-    } catch (e) {
-        log("WEBVIEW", "WebView hooks: " + e);
+function printTriggers() {
+    console.log("\n=== TRIGGERED DETECTIONS ===");
+    for (var i = 0; i < DETECTIONS.length; i++) {
+        var d = DETECTIONS[i];
+        console.log("[" + d.cat + "] " + d.msg);
     }
+    console.log("Total: " + DETECTIONS.length);
+    console.log("============================\n");
+}
 
-    // --- 9b) Chrome Custom Tabs monitoring ---
-    try {
-        var CustomTabsBuilder = Java.use("com.bitso.android.authCore.core.action.a");
-        CustomTabsBuilder.a.implementation = function () {
-            logDetection("WEBVIEW_CUSTOMTAB", "Chrome Custom Tab intent builder called");
-            return this.a();
-        };
-    } catch (e) {
-        log("WEBVIEW", "Custom Tab hook: " + e);
+function printErrors() {
+    console.log("\n=== ERRORS ===");
+    for (var i = 0; i < ERRORS.length; i++) {
+        var e = ERRORS[i];
+        console.log("[" + e.cat + "] " + e.msg);
     }
-
-    // --- 9c) Inject JS into WebViews to spoof environment ---
-    var webViewSpoofJS = [
-        "// Bitso bypass - WebView environment spoofing",
-        "Object.defineProperty(navigator, 'userAgent', {",
-        "  get: function() { return 'Mozilla/5.0 (Linux; Android 11; Pixel 2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'; }",
-        "});",
-        "// Remove Frida-injected properties",
-        "delete window.__frida__;",
-        "delete window.frida;",
-        "// Spoof WebGL renderer for emulator detection",
-        "if (typeof WebGLRenderingContext !== 'undefined') {",
-        "  var origGetParam = WebGLRenderingContext.prototype.getParameter;",
-        "  WebGLRenderingContext.prototype.getParameter = function(param) {",
-        "    if (param === 0x1F01) return 'Adreno (TM) 540';",
-        "    if (param === 0x1F00) return 'Qualcomm';",
-        "    return origGetParam.call(this, param);",
-        "  };",
-        "}"
-    ].join("\n");
-
-    try {
-        var WebViewClient = Java.use("android.webkit.WebViewClient");
-        WebViewClient.onPageFinished.implementation = function (view, url) {
-            logDetection("WEBVIEW_LOADED", "Page finished: " + url);
-            // Inject our spoofing JS
-            view.evaluateJavascript(webViewSpoofJS, null);
-            log("WEBVIEW", "Spoofing JS injected into: " + url);
-            this.onPageFinished(view, url);
-        };
-    } catch (e) {
-        log("WEBVIEW", "WebViewClient.onPageFinished hook: " + e);
-    }
-
-    log("WEBVIEW", "WebView detection bypass initialized");
+    console.log("Total: " + ERRORS.length);
+    console.log("===============\n");
 }
 
 // ============================================================
-// 10) NETWORK MONITORING BYPASS
+// MAIN - Two-phase startup to avoid Android 15 Thread bug
 // ============================================================
-function bypassNetworkDetection() {
-    log("NETWORK", "Initializing network monitoring bypass...");
+console.log("==================================================");
+console.log("[*] Bitso Bypass v" + VERSION + " - Android 15 Compatible");
+console.log("[*] Phase 1: Native hooks (no Java VM)");
+console.log("==================================================");
 
-    // --- 10a) VPN detection bypass ---
-    try {
-        var NetworkInterface = Java.use("java.net.NetworkInterface");
-        NetworkInterface.getName.implementation = function () {
-            var name = this.getName();
-            if (name === "tun0" || name === "ppp0" || name === "tap0") {
-                logDetection("NETWORK_VPN", "VPN interface hidden: " + name);
-                return "wlan0";
-            }
-            return name;
-        };
-    } catch (e) {
-        log("NETWORK", "VPN detection bypass: " + e);
-    }
+// PHASE 1: Native hooks - immediate, no Java.perform
+installNativeHooks();
 
-    // --- 10b) Proxy detection bypass ---
-    try {
-        var System = Java.use("java.lang.System");
-        var origGetProperty = System.getProperty.overload("java.lang.String");
-        System.getProperty.overload("java.lang.String").implementation = function (key) {
-            if (key === "http.proxyHost" || key === "http.proxyPort" ||
-                key === "https.proxyHost" || key === "https.proxyPort") {
-                logDetection("NETWORK_PROXY", "Proxy property check hidden: " + key);
-                return null;
-            }
-            return origGetProperty.call(this, key);
-        };
-    } catch (e) {
-        log("NETWORK", "Proxy detection bypass: " + e);
-    }
+// PHASE 2: Java hooks - delayed 1.5s to let ART VM fully initialize
+// This avoids "Unable to find copied methods in java/lang/Thread" bug
+console.log("[*] Phase 2: Java hooks starting in 1.5s...");
 
-    log("NETWORK", "Network monitoring bypass initialized");
-}
+setTimeout(function () {
+    Java.perform(function () {
+        try {
+            installJavaHooks();
+        } catch (e) {
+            logErr("INIT", "Java hooks failed: " + e);
+            console.log("[!] Retrying Java hooks in 3s...");
+            setTimeout(function () {
+                Java.perform(function () {
+                    try {
+                        installJavaHooks();
+                    } catch (e2) {
+                        logErr("INIT", "Java hooks RETRY failed: " + e2);
+                        console.log("[!!!] Java hooks could not be installed.");
+                        console.log("[!!!] Native-only protection is active.");
+                    }
+                });
+            }, 3000);
+        }
+    });
 
-// ============================================================
-// MAIN ENTRY POINT
-// ============================================================
-Java.perform(function () {
-    log("INIT", "=== Bitso Wallet Bypass Script Starting ===");
-    log("INIT", "Target: com.bitso.wallet");
-    log("INIT", "Timestamp: " + new Date().toISOString());
+    setTimeout(function () {
+        console.log("\n==================================================");
+        console.log("[*] Bitso Bypass v" + VERSION + " - READY");
+        console.log("[*] Hooks: " + hookStats.installed + " OK, " + hookStats.failed + " failed");
+        console.log("[*] Commands: printStats() printTriggers() printErrors()");
+        console.log("==================================================\n");
+    }, 3000);
+}, 1500);
 
-    try { bypassRootDetection(); } catch (e) { log("ERROR", "Root bypass failed: " + e); }
-    try { bypassFridaDetection(); } catch (e) { log("ERROR", "Frida bypass failed: " + e); }
-    try { bypassSSLPinning(); } catch (e) { log("ERROR", "SSL bypass failed: " + e); }
-    try { bypassEmulatorDetection(); } catch (e) { log("ERROR", "Emulator bypass failed: " + e); }
-    try { bypassDebuggerDetection(); } catch (e) { log("ERROR", "Debugger bypass failed: " + e); }
-    try { bypassPlayIntegrity(); } catch (e) { log("ERROR", "Play Integrity bypass failed: " + e); }
-    try { bypassFingerprintJS(); } catch (e) { log("ERROR", "FingerprintJS bypass failed: " + e); }
-    try { bypassIproovCalcifer(); } catch (e) { log("ERROR", "iProov bypass failed: " + e); }
-    try { bypassWebViewDetection(); } catch (e) { log("ERROR", "WebView bypass failed: " + e); }
-    try { bypassNetworkDetection(); } catch (e) { log("ERROR", "Network bypass failed: " + e); }
-
-    log("INIT", "=== All bypass modules loaded ===");
-    log("INIT", "Monitoring active - detections will be logged in real-time");
-    log("INIT", "Use the relay script to send output for analysis");
-});
-
-// ============================================================
-// MESSAGE HANDLER (for relay communication)
-// ============================================================
+// RPC exports
 rpc.exports = {
-    getDetections: function () {
-        return DETECTIONS_FOUND;
-    },
+    getDetections: function () { return DETECTIONS; },
     getStatus: function () {
-        return {
-            detections: DETECTIONS_FOUND.length,
-            modules: [
-                "ROOT", "FRIDA", "SSL", "EMULATOR",
-                "DEBUGGER", "INTEGRITY", "FPJS",
-                "IPROOV", "WEBVIEW", "NETWORK"
-            ]
-        };
-    },
-    clearDetections: function () {
-        DETECTIONS_FOUND = [];
-        return "Detections cleared";
+        return { hooks: hookStats, detections: DETECTIONS.length, errors: ERRORS.length };
     }
 };
